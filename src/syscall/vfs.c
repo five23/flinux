@@ -2252,6 +2252,12 @@ DEFINE_SYSCALL(fcntl, int, fd, int, cmd, int, arg)
 				f->flags = (f->flags & ~O_NONBLOCK) | (arg & O_NONBLOCK);
 			break;
 		}
+		case F_SETLK64:
+			log_error("Unsupported command: %d", cmd);
+			break;
+		case F_SETLKW64:
+			log_error("Unsupported command: %d", cmd);
+			break;
 		default:
 			log_error("Unsupported command: %d", cmd);
 			r = -L_EINVAL;
