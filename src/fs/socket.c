@@ -254,7 +254,9 @@ static void socket_fork(struct file *f, HANDLE child_process, DWORD child_proces
 {
 	struct socket_file *socket_file = (struct socket_file *) f;
 	AcquireSRWLockExclusive(&f->rw_lock);
-	WSADuplicateSocketW(socket_file->socket, child_process_id, &socket_file->fork_info);
+	
+	//there's some race condition with WSADuplicateSocket - verified using apache bench
+	//WSADuplicateSocketW(socket_file->socket, child_process_id, &socket_file->fork_info);
 }
 
 static void socket_after_fork_parent(struct file *f)
@@ -265,10 +267,7 @@ static void socket_after_fork_parent(struct file *f)
 static void socket_after_fork_child(struct file *f)
 {
 	struct socket_file *socket_file = (struct socket_file *) f;
-	socket_ensure_initialized();
-	socket_file->socket = WSASocketW(0, 0, 0, &socket_file->fork_info, 0, 0);
-	if (socket_file->socket == INVALID_SOCKET)
-		log_error("WSASocketW() failed, error code: %d", socket_file->socket);
+	socket_ensure_initialized();	
 }
 
 static int socket_wait_event(struct socket_file *f, int event, int flags)
