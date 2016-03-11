@@ -238,6 +238,8 @@ static int socket_get_poll_status(struct file *f)
 		ret |= LINUX_POLLIN | LINUX_POLLHUP;
 	if (e & FD_WRITE)
 		ret |= LINUX_POLLOUT;
+	if (e & FD_ACCEPT)
+		ret |= LINUX_POLLIN;
 	return ret;
 }
 
