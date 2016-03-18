@@ -21,9 +21,11 @@
 
 #include <atlbase.h>
 #include <atlapp.h>
+#include <atlmisc.h>
 #include <atlwin.h>
 #include <atlframe.h>
 #include <atlsplit.h>
+#include <atlscrl.h>
 #include <atlcrack.h>
 #include <atlctrls.h>
 #include <atlutil.h>

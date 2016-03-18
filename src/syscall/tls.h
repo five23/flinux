@@ -19,19 +19,35 @@
 
 #pragma once
 
-#include <stdint.h>
+#include <common/ldt.h>
 
-#define TLS_KERNEL_ENTRY_COUNT	3
-/* Used by dbt */
-#define TLS_ENTRY_SCRATCH		0
-#define TLS_ENTRY_GS			1
-#define TLS_ENTRY_GS_ADDR		2
+#include <stdint.h>
+#define WIN32_LEAN_AND_MEAN
+#include <Windows.h>
+
+enum
+{
+	/* Used by dbt */
+	TLS_ENTRY_DBT,
+	TLS_ENTRY_SCRATCH,
+	TLS_ENTRY_GS,
+	TLS_ENTRY_GS_ADDR,
+	TLS_ENTRY_RETURN_ADDR,
+	TLS_ENTRY_KERNEL_ESP,
+	TLS_ENTRY_ESP,
+	TLS_ENTRY_EIP,
+
+	TLS_KERNEL_ENTRY_COUNT
+};
 
 void tls_init();
 void tls_reset();
 void tls_shutdown();
-void tls_beforefork();
-void tls_afterfork();
+int tls_fork(HANDLE process);
+void tls_afterfork_parent();
+void tls_afterfork_child();
 
 int tls_kernel_entry_to_offset(int entry);
 int tls_user_entry_to_offset(int entry);
+
+int tls_set_thread_area(struct user_desc *u_info);

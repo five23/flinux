@@ -24,12 +24,17 @@
 #include <syscall/fork.h>
 #include <syscall/mm.h>
 #include <syscall/process.h>
+#include <syscall/process_info.h>
 #include <syscall/syscall.h>
 #include <syscall/tls.h>
+#include <flags.h>
+#include <heap.h>
 #include <log.h>
+#include <shared.h>
 
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
+#include <ntdll.h>
 
 /* Fork process
  *
@@ -40,39 +45,34 @@
  * 5. Wake up child process, it will use fork_info to restore context
  */
 
-struct syscall_context
-{
-	/* Note: should be kept consistent with syscall trampoline in x86_trampoline.asm */
-	DWORD ebx;
-	DWORD ecx;
-	DWORD edx;
-	DWORD esi;
-	DWORD edi;
-	DWORD ebp;
-	DWORD esp;
-	DWORD eip;
-};
-
 struct fork_info
 {
 	struct syscall_context context;
+	int flags;
 	void *stack_base;
 	void *ctid;
-};
+	pid_t pid;
+	int gs;
+	struct user_desc tls_data;
+} _fork;
 
-static struct fork_info * const fork = FORK_INFO_BASE;
-
-__declspec(noreturn) void restore_fork_context(struct syscall_context *context);
+static struct fork_info *fork = &_fork;
 
 __declspec(noreturn) static void fork_child()
 {
 	install_syscall_handler();
-	tls_afterfork();
-	process_init(fork->stack_base);
+	mm_afterfork_child();
+	flags_afterfork_child();
+	shared_afterfork_child();
+	heap_afterfork_child();
+	signal_afterfork_child();
+	process_afterfork_child(fork->stack_base, fork->pid);
+	tls_afterfork_child();
+	vfs_afterfork_child();
 	dbt_init();
 	if (fork->ctid)
-		*(pid_t *)fork->ctid = GetCurrentProcessId();
-	restore_fork_context(&fork->context);
+		*(pid_t *)fork->ctid = fork->pid;
+	dbt_restore_fork_context(&fork->context);
 }
 
 void fork_init()
@@ -80,7 +80,7 @@ void fork_init()
 	if (!strcmp(GetCommandLineA(), "/?/fork"))
 	{
 		/* We're a fork child */
-		log_info("We're a fork child.\n");
+		log_info("We're a fork child.");
 		fork_child();
 	}
 	else
@@ -110,31 +110,29 @@ void fork_init()
 		else
 		{
 			/* Not good, create a child process and hope this time we can do it better */
-			log_warning("The address %p is occupied, we have to create another process to proceed.\n", region_start);
+			log_warning("The address %p is occupied, we have to create another process to proceed.", region_start);
 			wchar_t filename[MAX_PATH];
-			GetModuleFileNameW(NULL, filename, sizeof(filename));
+			GetModuleFileNameW(NULL, filename, sizeof(filename) / sizeof(filename[0]));
 			PROCESS_INFORMATION info;
 			STARTUPINFOW si = { 0 };
 			si.cb = sizeof(si);
 			if (!CreateProcessW(filename, GetCommandLineW(), NULL, NULL, TRUE, CREATE_SUSPENDED, NULL, NULL, &si, &info))
 			{
-				log_error("CreateProcessW() failed, error code: %d\n", GetLastError());
-				ExitProcess(1);
+				log_error("CreateProcessW() failed, error code: %d", GetLastError());
+				process_exit(1, 0);
 			}
 			/* Pre-reserve the memory */
 			if (!VirtualAllocEx(info.hProcess, region_start, region_size, MEM_RESERVE, PAGE_NOACCESS))
 			{
-				log_error("VirtualAllocEx() failed, error code: %d\n", GetLastError());
-				ExitProcess(1);
+				log_error("VirtualAllocEx() failed, error code: %d", GetLastError());
+				process_exit(1, 0);
 			}
 			/* All done */
 			log_shutdown();
 			ResumeThread(info.hThread);
-			ExitProcess(0);
+			process_exit(1, 0);
 		}
 #endif
-		/* Allocate fork_info memory early to avoid possible VirtualAlloc() collision */
-		VirtualAlloc(FORK_INFO_BASE, BLOCK_SIZE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
 		/* Return control flow to main() */
 	}
 }
@@ -149,9 +147,9 @@ void fork_init()
  o CLONE_THREAD
  o CLONE_NEWNS
  o CLONE_SYSVSEM
- o CLONE_SETTLS
- o CLONE_PARENT_SETTID
- o CLONE_CHILD_CLEARTID
+ * CLONE_SETTLS
+ * CLONE_PARENT_SETTID
+ * CLONE_CHILD_CLEARTID
  o CLONE_DETACHED
  o CLONE_UNTRACED
  * CLONE_CHILD_SETTID
@@ -165,44 +163,72 @@ void fork_init()
 static pid_t fork_process(struct syscall_context *context, unsigned long flags, void *ptid, void *ctid)
 {
 	wchar_t filename[MAX_PATH];
-	GetModuleFileNameW(NULL, filename, sizeof(filename));
-
-	tls_beforefork();
+	GetModuleFileNameW(NULL, filename, sizeof(filename) / sizeof(filename[0]));
 	
 	PROCESS_INFORMATION info;
 	STARTUPINFOW si = { 0 };
 	si.cb = sizeof(si);
 	if (!CreateProcessW(filename, L"/?/fork", NULL, NULL, TRUE, CREATE_SUSPENDED, NULL, NULL, &si, &info))
 	{
-		log_warning("fork(): CreateProcessW() failed.\n");
+		log_warning("fork(): CreateProcessW() failed.");
 		return -1;
 	}
+
+	if (!tls_fork(info.hProcess))
+		goto fail;
 
 	if (!mm_fork(info.hProcess))
 		goto fail;
 
-	if (!vfs_fork(info.hProcess))
+	if (!shared_fork(info.hProcess))
 		goto fail;
+
+	if (!heap_fork(info.hProcess))
+		goto fail;
+
+	if (!signal_fork(info.hProcess))
+		goto fail;
+
+	if (!process_fork(info.hProcess))
+		goto fail;
+
+	if (!vfs_fork(info.hProcess, info.dwProcessId))
+		goto fail;
+
+	if (!exec_fork(info.hProcess))
+		goto fail;
+
+	pid_t pid = process_init_child(info.dwProcessId, info.dwThreadId, info.hProcess);
 
 	/* Set up fork_info in child process */
 	void *stack_base = process_get_stack_base();
-	VirtualAllocEx(info.hProcess, FORK_INFO_BASE, BLOCK_SIZE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-	WriteProcessMemory(info.hProcess, &fork->context, context, sizeof(struct syscall_context), NULL);
-	WriteProcessMemory(info.hProcess, &fork->stack_base, &stack_base, sizeof(stack_base), NULL);
+	NtWriteVirtualMemory(info.hProcess, &fork->context, context, sizeof(struct syscall_context), NULL);
+	NtWriteVirtualMemory(info.hProcess, &fork->stack_base, &stack_base, sizeof(stack_base), NULL);
+	NtWriteVirtualMemory(info.hProcess, &fork->pid, &pid, sizeof(pid_t), NULL);
 	if (flags & CLONE_CHILD_SETTID)
-		WriteProcessMemory(info.hProcess, &fork->ctid, &ctid, sizeof(void*), NULL);
+		NtWriteVirtualMemory(info.hProcess, &fork->ctid, &ctid, sizeof(void*), NULL);
+	if (flags & CLONE_PARENT_SETTID)
+		*(pid_t*)ptid = pid;
 
 	/* Copy stack */
 	VirtualAllocEx(info.hProcess, stack_base, STACK_SIZE, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
-	WriteProcessMemory(info.hProcess, context->esp, context->esp, (char *)stack_base + STACK_SIZE - context->esp, NULL);
-
+	NtWriteVirtualMemory(info.hProcess, (PVOID)context->esp, (PVOID)context->esp,
+		(SIZE_T)((char *)stack_base + STACK_SIZE - context->esp), NULL);
 	ResumeThread(info.hThread);
-
 	CloseHandle(info.hThread);
-	/* Process handled will be used for wait() */
-	log_info("Child pid: %d\n", info.dwProcessId);
-	process_add_child(info.dwProcessId, info.hProcess);
-	return info.dwProcessId;
+
+	/* Call afterfork routines */
+	vfs_afterfork_parent();
+	tls_afterfork_parent();
+	process_afterfork_parent();
+	signal_afterfork_parent();
+	heap_afterfork_parent();
+	shared_afterfork_parent();
+	flags_afterfork_parent();
+	mm_afterfork_parent();
+
+	log_info("Child pid: %d, win_pid: %d", pid, info.dwProcessId);
+	return pid;
 
 fail:
 	TerminateProcess(info.hProcess, 0);
@@ -211,15 +237,59 @@ fail:
 	return -1;
 }
 
+static DWORD WINAPI fork_thread_callback(void *data)
+{
+	/* This function runs in child thread */
+	struct fork_info *info = (struct fork_info *)data;
+	log_init_thread();
+	dbt_init_thread();
+	process_thread_entry(info->pid);
+	if (info->flags & CLONE_SETTLS)
+		tls_set_thread_area(&info->tls_data);
+	if (info->flags & CLONE_CHILD_CLEARTID)
+		current_thread->clear_tid = info->ctid;
+	else
+		current_thread->clear_tid = NULL;
+	dbt_update_tls(info->gs);
+	struct syscall_context context = info->context;
+	context.eax = 0;
+	VirtualFree(info, 0, MEM_RELEASE);
+	dbt_restore_fork_context(&context);
+	return 0;
+}
+
+static pid_t fork_thread(struct syscall_context *context, void *child_stack, unsigned long flags, void *ptid, void *ctid)
+{
+	struct fork_info *info = VirtualAlloc(NULL, sizeof(struct fork_info), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+	DWORD win_tid;
+	HANDLE handle = CreateThread(NULL, 0, fork_thread_callback, info, CREATE_SUSPENDED, &win_tid);
+	pid_t pid = process_create_thread(win_tid);
+	info->context = *context;
+	info->context.esp = (DWORD)child_stack;
+	info->pid = pid;
+	info->ctid = ctid;
+	info->flags = flags;
+	if (flags & CLONE_CHILD_SETTID)
+		*(pid_t *)ctid = pid;
+	if (flags & CLONE_PARENT_SETTID)
+		*(pid_t *)ptid = pid;
+	info->gs = dbt_get_gs();
+	if (flags & CLONE_SETTLS)
+		info->tls_data = *(struct user_desc *)context->esi;
+	ResumeThread(handle);
+	CloseHandle(handle);
+	return pid;
+}
+
 int sys_fork_imp(struct syscall_context *context)
 {
-	log_info("fork()\n");
+	log_info("fork()");
 	return fork_process(context, 0, NULL, NULL);
 }
 
 int sys_vfork_imp(struct syscall_context *context)
 {
-	log_info("vfork()\n");
+	log_info("vfork()");
 	return fork_process(context, 0, NULL, NULL);
 }
 
@@ -229,12 +299,9 @@ int sys_clone_imp(struct syscall_context *context, unsigned long flags, void *ch
 int sys_clone_imp(struct syscall_context *context, unsigned long flags, void *child_stack, void *ptid, int tls, void *ctid)
 #endif
 {
-	log_info("sys_clone(flags=%x, child_stack=%p, ptid=%p, ctid=%p)\n", flags, child_stack, ptid, ctid);
+	log_info("sys_clone(flags=%x, child_stack=%p, ptid=%p, ctid=%p)", flags, child_stack, ptid, ctid);
 	if (flags & CLONE_THREAD)
-	{
-		log_error("Threads not supported.\n");
-		return -1;
-	}
+		return fork_thread(context, child_stack, flags, ptid, ctid);
 	else
 		return fork_process(context, flags, ptid, ctid);
 }

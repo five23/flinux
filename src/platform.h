@@ -21,6 +21,8 @@
 
 #ifdef _WIN64
 #define Xip Rip
+#define XWORD QWORD
 #else
 #define Xip Eip
+#define XWORD DWORD
 #endif

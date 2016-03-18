@@ -90,7 +90,7 @@ int kvsprintf(char *buffer, const char *format, va_list args)
 			case 'c':
 			{
 				format = f;
-				*buf++ = va_arg(args, const char *);
+				*buf++ = va_arg(args, char);
 				continue;
 			}
 
@@ -102,6 +102,17 @@ int kvsprintf(char *buffer, const char *format, va_list args)
 					continue;
 				while (*ch)
 					*buf++ = *ch++;
+				continue;
+			}
+
+			case 'S':
+			{
+				format = f;
+				const wchar_t *ch = va_arg(args, const wchar_t *);
+				if (!ch)
+					continue;
+				while (*ch)
+					*buf++ = (char)*ch++;
 				continue;
 			}
 
@@ -142,6 +153,18 @@ int kvsprintf(char *buffer, const char *format, va_list args)
 
 			case 'l':
 			{
+				if (f[0] == 'd')
+				{
+					format = f + 1;
+					PRINT_NUM(buf, va_arg(args, intptr_t), intptr_t, uintptr_t, 10, lowercase, width, fillchar);
+					continue;
+				}
+				if (f[0] == 'u')
+				{
+					format = f + 1;
+					PRINT_NUM(buf, va_arg(args, uintptr_t), uintptr_t, uintptr_t, 10, lowercase, width, fillchar);
+					continue;
+				}
 				if (f[0] == 'l' && f[1] == 'x')
 				{
 					format = f + 2;
@@ -152,6 +175,12 @@ int kvsprintf(char *buffer, const char *format, va_list args)
 				{
 					format = f + 2;
 					PRINT_NUM(buf, va_arg(args, int64_t), int64_t, uint64_t, 10, lowercase, width, fillchar);
+					continue;
+				}
+				if (f[0] == 'l' && f[1] == 'u')
+				{
+					format = f + 2;
+					PRINT_NUM(buf, va_arg(args, uint64_t), uint64_t, uint64_t, 10, lowercase, width, fillchar);
 					continue;
 				}
 			}

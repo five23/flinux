@@ -13,11 +13,14 @@
     <Filter Include="fs">
       <UniqueIdentifier>{b5499d5e-1549-4423-8644-e1c3d92fee62}</UniqueIdentifier>
     </Filter>
-    <Filter Include="core">
-      <UniqueIdentifier>{bf8b2302-bfb8-482c-bb5a-68176dce23d8}</UniqueIdentifier>
-    </Filter>
     <Filter Include="dbt">
       <UniqueIdentifier>{02ac593e-eb9d-4e52-8b21-4974493b4fa6}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="lib">
+      <UniqueIdentifier>{bf8b2302-bfb8-482c-bb5a-68176dce23d8}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="rc">
+      <UniqueIdentifier>{12cf0f16-d8d6-45c7-9cfd-ea38d2eff008}</UniqueIdentifier>
     </Filter>
   </ItemGroup>
   <ItemGroup>
@@ -131,12 +134,6 @@
     <ClInclude Include="src\common\select.h">
       <Filter>common</Filter>
     </ClInclude>
-    <ClInclude Include="src\core\core.h">
-      <Filter>core</Filter>
-    </ClInclude>
-    <ClInclude Include="src\core\forward_list.h">
-      <Filter>core</Filter>
-    </ClInclude>
     <ClInclude Include="src\syscall\timer.h">
       <Filter>syscall</Filter>
     </ClInclude>
@@ -201,6 +198,74 @@
     </ClInclude>
     <ClInclude Include="src\common\in.h">
       <Filter>common</Filter>
+    </ClInclude>
+    <ClInclude Include="src\lib\core.h">
+      <Filter>lib</Filter>
+    </ClInclude>
+    <ClInclude Include="src\lib\slist.h">
+      <Filter>lib</Filter>
+    </ClInclude>
+    <ClInclude Include="src\lib\rbtree.h">
+      <Filter>lib</Filter>
+    </ClInclude>
+    <ClInclude Include="src\common\sigcontext.h">
+      <Filter>common</Filter>
+    </ClInclude>
+    <ClInclude Include="src\common\sigframe.h">
+      <Filter>common</Filter>
+    </ClInclude>
+    <ClInclude Include="src\fs\eventfd.h">
+      <Filter>fs</Filter>
+    </ClInclude>
+    <ClInclude Include="src\fs\virtual.h">
+      <Filter>fs</Filter>
+    </ClInclude>
+    <ClInclude Include="src\fs\procfs.h">
+      <Filter>fs</Filter>
+    </ClInclude>
+    <ClInclude Include="src\fs\sysfs.h">
+      <Filter>fs</Filter>
+    </ClInclude>
+    <ClInclude Include="src\vsscanf.h" />
+    <ClInclude Include="src\common\param.h">
+      <Filter>common</Filter>
+    </ClInclude>
+    <ClInclude Include="src\lib\list.h">
+      <Filter>lib</Filter>
+    </ClInclude>
+    <ClInclude Include="src\syscall\process_info.h">
+      <Filter>syscall</Filter>
+    </ClInclude>
+    <ClInclude Include="src\fs\dsp.h">
+      <Filter>fs</Filter>
+    </ClInclude>
+    <ClInclude Include="src\common\soundcard.h">
+      <Filter>common</Filter>
+    </ClInclude>
+    <ClInclude Include="src\fs\epollfd.h">
+      <Filter>fs</Filter>
+    </ClInclude>
+    <ClInclude Include="src\common\eventpoll.h">
+      <Filter>common</Filter>
+    </ClInclude>
+    <ClInclude Include="src\fs\inotify.h">
+      <Filter>fs</Filter>
+    </ClInclude>
+    <ClInclude Include="src\common\inotify.h">
+      <Filter>common</Filter>
+    </ClInclude>
+    <ClInclude Include="src\syscall\futex.h">
+      <Filter>syscall</Filter>
+    </ClInclude>
+    <ClInclude Include="src\version.h" />
+    <ClInclude Include="src\flags.h" />
+    <ClInclude Include="src\win7compat.h" />
+    <ClInclude Include="src\shared.h" />
+    <ClInclude Include="src\rc\resource1.h">
+      <Filter>rc</Filter>
+    </ClInclude>
+    <ClInclude Include="src\fs\zero.h">
+      <Filter>fs</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
@@ -267,12 +332,47 @@
     <ClCompile Include="src\dbt\cpuid.c">
       <Filter>dbt</Filter>
     </ClCompile>
-    <ClCompile Include="src\fs\file.c">
+    <ClCompile Include="src\wcwidth.c" />
+    <ClCompile Include="src\lib\rbtree.c">
+      <Filter>lib</Filter>
+    </ClCompile>
+    <ClCompile Include="src\fs\eventfd.c">
       <Filter>fs</Filter>
     </ClCompile>
-  </ItemGroup>
-  <ItemGroup>
-    <CustomBuild Include="src\ntdll.def" />
+    <ClCompile Include="src\fs\virtual.c">
+      <Filter>fs</Filter>
+    </ClCompile>
+    <ClCompile Include="src\fs\procfs.c">
+      <Filter>fs</Filter>
+    </ClCompile>
+    <ClCompile Include="src\fs\sysfs.c">
+      <Filter>fs</Filter>
+    </ClCompile>
+    <ClCompile Include="src\vsscanf.c" />
+    <ClCompile Include="src\fs\dsp.c">
+      <Filter>fs</Filter>
+    </ClCompile>
+    <ClCompile Include="src\fs\epollfd.c">
+      <Filter>fs</Filter>
+    </ClCompile>
+    <ClCompile Include="src\fs\inotify.c">
+      <Filter>fs</Filter>
+    </ClCompile>
+    <ClCompile Include="src\dbt\x86_inst_table.c">
+      <Filter>dbt</Filter>
+    </ClCompile>
+    <ClCompile Include="src\dbt\x86_inst.c">
+      <Filter>dbt</Filter>
+    </ClCompile>
+    <ClCompile Include="src\syscall\futex.c">
+      <Filter>syscall</Filter>
+    </ClCompile>
+    <ClCompile Include="src\flags.c" />
+    <ClCompile Include="src\win7compat.c" />
+    <ClCompile Include="src\shared.c" />
+    <ClCompile Include="src\fs\zero.c">
+      <Filter>fs</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <MASM Include="src\syscall\stubs64.asm">
@@ -284,5 +384,10 @@
     <MASM Include="src\dbt\x86_trampoline.asm">
       <Filter>dbt</Filter>
     </MASM>
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="src\rc\flinux.rc">
+      <Filter>rc</Filter>
+    </ResourceCompile>
   </ItemGroup>
 </Project>

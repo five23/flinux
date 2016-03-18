@@ -17,6 +17,7 @@
  * along with this program. If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <syscall/process.h>
 #include <syscall/syscall.h>
 #include <syscall/syscall_dispatch.h>
 #include <log.h>
@@ -27,7 +28,7 @@
 
 typedef int64_t syscall_fn(int64_t rdi, int64_t rsi, int64_t rdx, int64_t r10, intptr_t r8, intptr_t r9, PCONTEXT context);
 
-#define SYSCALL_COUNT 317
+#define SYSCALL_COUNT 323
 #define SYSCALL(name) extern int64_t sys_##name(int64_t rdi, int64_t rsi, int64_t rdx, int64_t r10, intptr_t r8, intptr_t r9, PCONTEXT context);
 SYSCALL(read) /* syscall 0 */
 #include "syscall_table_x64.h"
@@ -45,7 +46,7 @@ static syscall_fn* syscall_table[SYSCALL_COUNT] =
 
 typedef int syscall_fn(int ebx, int ecx, int edx, int esi, int edi, int ebp, PCONTEXT context);
 
-#define SYSCALL_COUNT 354
+#define SYSCALL_COUNT 359
 #define SYSCALL(name) extern int sys_##name(int ebx, int ecx, int edx, int esi, int edi, int ebp, PCONTEXT context);
 #include "syscall_table_x86.h"
 #undef SYSCALL
@@ -61,9 +62,9 @@ syscall_fn* syscall_table[SYSCALL_COUNT] =
 
 void sys_unimplemented_imp(intptr_t id)
 {
-	log_error("FATAL: Unimplemented syscall: %d\n", id);
+	log_error("FATAL: Unimplemented syscall: %d", id);
 	__debugbreak();
-	ExitProcess(1);
+	process_exit(1, 0);
 }
 
 void dispatch_syscall(PCONTEXT context)

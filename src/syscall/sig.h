@@ -18,3 +18,35 @@
  */
 
 #pragma once
+
+#include <common/types.h>
+#include <common/signal.h>
+#include <dbt/x86.h>
+
+#define WIN32_LEAN_AND_MEAN
+#include <Windows.h>
+
+HANDLE signal_get_process_wait_semaphore();
+HANDLE signal_get_process_sigwrite();
+HANDLE signal_get_process_query_mutex();
+void signal_init_child(struct child_process *proc);
+
+void signal_setup_handler(struct syscall_context *context);
+
+void signal_init();
+void signal_reset();
+int signal_fork(HANDLE process);
+void signal_afterfork_parent();
+void signal_afterfork_child();
+void signal_shutdown();
+void signal_init_thread(struct thread *thread);
+void signal_exit_thread(struct thread *thread);
+int signal_kill(pid_t pid, siginfo_t *siginfo);
+DWORD signal_wait(int count, HANDLE *handles, DWORD milliseconds);
+void signal_before_pwait(const sigset_t *sigmask, sigset_t *oldmask);
+void signal_after_pwait(const sigset_t *oldmask);
+
+/* signal_wait() is interrupted by an incoming signal */
+#define WAIT_INTERRUPTED	0x80000000
+
+int signal_query(DWORD win_pid, HANDLE sigwrite, HANDLE query_mutex, int query_type, char *buf);

@@ -21,6 +21,12 @@
 
 #include "LogServer.h"
 
+static DWORD WINAPI ThreadProc(LPVOID lpParameter)
+{
+	((LogServer *)lpParameter)->RunWorker();
+	return 0;
+}
+
 LogServer::~LogServer()
 {
 	Stop();
@@ -29,7 +35,7 @@ LogServer::~LogServer()
 void LogServer::Start(HWND hMainWnd)
 {
 	m_hMainWnd = hMainWnd;
-	m_worker = std::thread([=]() { RunWorker(); });
+	m_hWorker = CreateThread(NULL, 0, ThreadProc, this, 0, NULL);
 	m_started = true;
 }
 
@@ -38,7 +44,7 @@ void LogServer::Stop()
 	if (m_started)
 	{
 		PostQueuedCompletionStatus(m_hCompletionPort, 0, NULL, NULL);
-		m_worker.join();
+		WaitForSingleObject(m_hWorker, INFINITE);
 	}
 }
 
@@ -47,7 +53,7 @@ void LogServer::AddClient()
 	/* Create named pipe instance */
 	std::unique_ptr<Client> client(new Client());
 	client->hPipe = CreateNamedPipeW(L"\\\\.\\pipe\\flog_server", PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
-		PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_REJECT_REMOTE_CLIENTS,
+		PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
 		PIPE_UNLIMITED_INSTANCES, 32, LOG_BUFFER_SIZE, 0, nullptr);
 	memset(&client->overlapped, 0, sizeof(client->overlapped));
 
@@ -66,10 +72,10 @@ void LogServer::AddClient()
 void LogServer::RemoveClient(Client *client)
 {
 	CloseHandle(client->hPipe);
-	for (int i = 0; i < m_clients.size(); i++)
-		if (m_clients[i].get() == client)
+	for (auto i = m_clients.begin(); i != m_clients.end(); ++i)
+		if (i->get() == client)
 		{
-			m_clients.erase(m_clients.begin() + i);
+			m_clients.erase(i);
 			break;
 		}
 }
@@ -85,7 +91,7 @@ void LogServer::RemoveClient(Client *client)
  * Disconnect
  */
 
-#define PROTOCOL_VERSION	1
+#define PROTOCOL_VERSION	2
 #define PROTOCOL_MAGIC		'flog'
 struct Request
 {
@@ -140,7 +146,7 @@ void LogServer::RunWorker()
 					client->pid = request->pid;
 					client->tid = request->tid;
 					client->op = OP_READ;
-					SendMessageW(m_hMainWnd, WM_NEWCLIENT, (WPARAM)client->pid, 0);
+					SendMessageW(m_hMainWnd, WM_NEWCLIENT, (WPARAM)client->pid, (LPARAM)client->tid);
 					ReadFile(client->hPipe, client->buffer, LOG_BUFFER_SIZE, NULL, &client->overlapped);
 				}
 			}
@@ -155,6 +161,7 @@ void LogServer::RunWorker()
 			{
 				LogMessage msg;
 				msg.pid = client->pid;
+				msg.tid = client->tid;
 				msg.buffer = client->buffer;
 				msg.length = bytes;
 				SendMessageW(m_hMainWnd, WM_LOGRECEIVE, (WPARAM)&msg, 0);
@@ -164,7 +171,7 @@ void LogServer::RunWorker()
 		}
 		}
 	}
-	for (int i = 0; i < m_clients.size(); i++)
-		CloseHandle(m_clients[i]->hPipe);
+	for (auto const &client : m_clients)
+		CloseHandle(client->hPipe);
 	CloseHandle(m_hCompletionPort);
 }

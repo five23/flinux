@@ -19,4 +19,10 @@
 
 #pragma once
 
-int do_execve(const char *filename, int argc, char *argv[], int env_size, char *envp[], char *buffer_base);
+#define WIN32_LEAN_AND_MEAN
+#include <Windows.h>
+
+int do_execve(const char *filename, int argc, char *argv[], int env_size, char *envp[], char *buffer_base,
+	void(*initialize_routine)());
+
+int exec_fork(HANDLE process);

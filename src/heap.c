@@ -42,38 +42,60 @@ struct pool
 	struct bucket *first;
 };
 
-#define POOL_COUNT	9
+#define POOL_COUNT	11
 struct heap_data
 {
+	SRWLOCK rw_lock;
 	struct pool pools[POOL_COUNT];
 };
 
-static struct heap_data *const heap = MM_HEAP_BASE;
+static struct heap_data *heap;
 
 void heap_init()
 {
-	log_info("heap subsystem initializating...\n");
-	mm_mmap(MM_HEAP_BASE, sizeof(struct heap_data), PROT_READ | PROT_WRITE, MAP_FIXED | MAP_ANONYMOUS | MAP_PRIVATE, 0, NULL, 0);
-	heap->pools[0].objsize = 16;   heap->pools[0].first = NULL;
-	heap->pools[1].objsize = 32;   heap->pools[1].first = NULL;
-	heap->pools[2].objsize = 64;   heap->pools[2].first = NULL;
-	heap->pools[3].objsize = 128;  heap->pools[3].first = NULL;
-	heap->pools[4].objsize = 256;  heap->pools[4].first = NULL;
-	heap->pools[5].objsize = 512;  heap->pools[5].first = NULL;
-	heap->pools[6].objsize = 1024; heap->pools[6].first = NULL;
-	heap->pools[7].objsize = 2048; heap->pools[7].first = NULL;
-	heap->pools[8].objsize = 4096; heap->pools[8].first = NULL;
-	log_info("heap subsystem initialized.\n");
+	log_info("heap subsystem initializating...");
+	heap = mm_static_alloc(sizeof(struct heap_data));
+	InitializeSRWLock(&heap->rw_lock);
+	heap->pools[0].objsize = 16;		heap->pools[0].first = NULL;
+	heap->pools[1].objsize = 32;		heap->pools[1].first = NULL;
+	heap->pools[2].objsize = 64;		heap->pools[2].first = NULL;
+	heap->pools[3].objsize = 128;		heap->pools[3].first = NULL;
+	heap->pools[4].objsize = 256;		heap->pools[4].first = NULL;
+	heap->pools[5].objsize = 512;		heap->pools[5].first = NULL;
+	heap->pools[6].objsize = 1024;		heap->pools[6].first = NULL;
+	heap->pools[7].objsize = 2048;		heap->pools[7].first = NULL;
+	heap->pools[8].objsize = 4096;		heap->pools[8].first = NULL;
+	heap->pools[9].objsize = 8192;		heap->pools[9].first = NULL;
+	heap->pools[10].objsize = 16384;	heap->pools[10].first = NULL;
+	log_info("heap subsystem initialized.");
 }
 
 void heap_shutdown()
 {
 }
 
+int heap_fork(HANDLE process)
+{
+	AcquireSRWLockShared(&heap->rw_lock);
+	return 1;
+}
+
+void heap_afterfork_parent()
+{
+	ReleaseSRWLockShared(&heap->rw_lock);
+}
+
+void heap_afterfork_child()
+{
+	heap = mm_static_alloc(sizeof(struct heap_data));
+	InitializeSRWLock(&heap->rw_lock);
+}
+
 #define ALIGN(x, align) (((x) + ((align) - 1)) & -(align))
 static struct bucket *alloc_bucket(int objsize)
 {
-	struct bucket *b = mm_mmap(0, BLOCK_SIZE, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, INTERNAL_MAP_HEAP, NULL, 0);
+	struct bucket *b = mm_mmap(NULL, BLOCK_SIZE, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE,
+		INTERNAL_MAP_TOPDOWN | INTERNAL_MAP_NORESET | INTERNAL_MAP_VIRTUALALLOC, NULL, 0);
 	b->ref_cnt = 0;
 	b->next_bucket = NULL;
 
@@ -91,6 +113,7 @@ static struct bucket *alloc_bucket(int objsize)
 
 void *kmalloc(int size)
 {
+	AcquireSRWLockExclusive(&heap->rw_lock);
 	/* Find pool */
 	int p = -1;
 	for (int i = 0; i < POOL_COUNT; i++)
@@ -101,7 +124,8 @@ void *kmalloc(int size)
 		}
 	if (p == -1)
 	{
-		log_error("kmalloc(%d): size too large.\n", size);
+		log_error("kmalloc(%d): size too large.", size);
+		ReleaseSRWLockExclusive(&heap->rw_lock);
 		return NULL;
 	}
 	
@@ -114,7 +138,8 @@ void *kmalloc(int size)
 	{
 		if (!current)
 		{
-			log_error("kmalloc(%d): out of memory\n", size);
+			log_error("kmalloc(%d): out of memory", size);
+			ReleaseSRWLockExclusive(&heap->rw_lock);
 			return NULL;
 		}
 
@@ -124,6 +149,7 @@ void *kmalloc(int size)
 			void *c = current->first_free;
 			current->first_free = *(void**)c;
 			current->ref_cnt++;
+			ReleaseSRWLockExclusive(&heap->rw_lock);
 			return c;
 		}
 
@@ -138,8 +164,9 @@ void *kmalloc(int size)
 
 void kfree(void *mem, int size)
 {
+	AcquireSRWLockExclusive(&heap->rw_lock);
 	/* Find memory bucket */
-	void *bucket_addr = (void *)((size_t) mem & (-PAGE_SIZE));
+	void *bucket_addr = (void *)((size_t) mem & (-BLOCK_SIZE));
 
 	/* Find pool */
 	int p = -1;
@@ -151,7 +178,8 @@ void kfree(void *mem, int size)
 		}
 	if (p == -1)
 	{
-		log_error("kfree(): Invalid size: %x\n", mem);
+		log_error("kfree(): Invalid size: %x", mem);
+		ReleaseSRWLockExclusive(&heap->rw_lock);
 		return;
 	}
 
@@ -180,7 +208,9 @@ void kfree(void *mem, int size)
 				previous->next_bucket = current->next_bucket;
 			mm_munmap(current, BLOCK_SIZE);
 		}
+		ReleaseSRWLockExclusive(&heap->rw_lock);
 		return;
 	}
-	log_error("kfree(): Invalid memory pointer or size: (%x, %d)\n", mem, size);
+	log_error("kfree(): Invalid memory pointer or size: (%x, %d)", mem, size);
+	ReleaseSRWLockExclusive(&heap->rw_lock);
 }

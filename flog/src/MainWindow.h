@@ -19,9 +19,11 @@
 
 #pragma once
 
+#include "DPIAware.h"
 #include "LogServer.h"
+#include "LogViewer.h"
 
-class MainWindow: public CFrameWindowImpl<MainWindow>
+class MainWindow: public CFrameWindowImpl<MainWindow>, public DPIAware
 {
 public:
 	BEGIN_MSG_MAP(MainWindow)
@@ -42,19 +44,21 @@ public:
 	LRESULT OnTreeItemChange(LPNMHDR pnmh);
 	
 private:
-	void InitLogViewer(CEdit &logViewer);
-	void SetCurrentLogViewer(CEdit &logViewer);
+	struct Client
+	{
+		uint32_t pid;
+		uint32_t tid;
+		HTREEITEM item;
+		LogViewer logViewer;
+		std::string msgpart;
+	};
+	void ProcessClientLog(Client *client, LogPacket *packet);
+	void InitLogViewer(LogViewer &logViewer);
+	void SetCurrentLogViewer(LogViewer &logViewer);
 
 	LogServer m_logServer;
 	CSplitterWindow m_splitter;
 	CTreeViewCtrl m_processTree;
-	CFont m_logViewerFont;
-	CEdit m_defaultLogViewer;
-	struct Client
-	{
-		uint32_t pid;
-		HTREEITEM item;
-		CEdit logViewer;
-	};
-	std::vector<std::unique_ptr<Client>> m_clients;
+	LogViewer m_defaultLogViewer;
+	std::vector<std::vector<std::unique_ptr<Client>>> m_clients;
 };

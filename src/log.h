@@ -19,17 +19,30 @@
 
 #pragma once
 
+void log_init_thread();
 void log_init();
 void log_shutdown();
-void log_raw_internal(const char *format, ...);
 void log_debug_internal(const char *format, ...);
 void log_info_internal(const char *format, ...);
 void log_warning_internal(const char *format, ...);
 void log_error_internal(const char *format, ...);
 
 extern int logger_attached;
-#define log_raw(format, ...) do { if (logger_attached) log_raw_internal(format, __VA_ARGS__); } while (0)
 #define log_debug(format, ...) do { if (logger_attached) log_debug_internal(format, __VA_ARGS__); } while (0)
 #define log_info(format, ...) do { if (logger_attached) log_info_internal(format, __VA_ARGS__); } while (0)
 #define log_warning(format, ...) do { if (logger_attached) log_warning_internal(format, __VA_ARGS__); } while (0)
 #define log_error(format, ...) do { if (logger_attached) log_error_internal(format, __VA_ARGS__); } while (0)
+
+#ifdef _DEBUG
+
+#define LOG_ASSERT_EXIT   127
+#define log_assert_format "Assertion expression `%s` failed in function %s, at file %s: %d.\n"
+#define log_assert(exp) do { if (logger_attached && !exp) log_assert_internal(log_assert_format, #exp, __FUNCTION__, __FILE__, __LINE__); } while (0)
+
+#else
+
+#define log_assert(exp)
+
+#endif // _DEBUG
+
+

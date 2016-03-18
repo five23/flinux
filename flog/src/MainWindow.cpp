@@ -22,13 +22,13 @@
 
 LRESULT MainWindow::OnCreate(LPCREATESTRUCT cs)
 {
+	DPIAware::Init(*this);
+
 	m_processTree.Create(*this, rcDefault, NULL,
 		WS_CHILD | WS_VISIBLE | WS_VSCROLL | TVS_HASLINES | TVS_LINESATROOT | TVS_HASBUTTONS,
 		WS_EX_CLIENTEDGE);
 
 	m_splitter.Create(*this, rcDefault, NULL, WS_CHILD | WS_VISIBLE);
-	m_logViewerFont.CreateFontW(18, 0, 0, 0, FW_DONTCARE, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-		OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, FF_DONTCARE, L"Consolas");
 	InitLogViewer(m_defaultLogViewer);
 	m_defaultLogViewer.SetWindowTextW(L"No Foreign Linux client connected.");
 
@@ -37,11 +37,13 @@ LRESULT MainWindow::OnCreate(LPCREATESTRUCT cs)
 	m_hWndClient = m_splitter;
 	UpdateLayout();
 
-	m_splitter.SetSplitterPos(240);
+	m_splitter.SetSplitterPos(GetPhysicalX(240));
 	m_splitter.SetSplitterExtendedStyle(0);
 	m_splitter.m_bFullDrag = FALSE;
 
 	m_logServer.Start(*this);
+
+	ResizeClient(GetPhysicalX(1280), GetPhysicalY(720));
 	return 0;
 }
 
@@ -58,37 +60,82 @@ void MainWindow::OnDestroy()
 LRESULT MainWindow::OnNewClient(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
 {
 	uint32_t pid = (uint32_t)wParam;
+	uint32_t tid = (uint32_t)lParam;
+	/* Find the place to insert item */
 	WCHAR text[256];
-	wsprintfW(text, L"PID: %d\n", pid);
-	HTREEITEM item = m_processTree.InsertItem(TVIF_TEXT, text, 0, 0, TVIS_BOLD, TVIS_BOLD, 0, NULL, NULL);
-	m_processTree.SetItemData(item, (DWORD_PTR)pid);
+	wsprintfW(text, L"PID: %d, TID: %d\n", pid, tid);
+	int parentId = -1;
+	HTREEITEM item = NULL;
+	for (int i = (int)m_clients.size() - 1; i >= 0; i--)
+	{
+		Client *parent = m_clients[i].front().get();
+		if (parent->pid == pid)
+		{
+			Client *after = m_clients[i].back().get();
+			item = m_processTree.InsertItem(TVIF_TEXT, text, 0, 0, TVIS_BOLD, TVIS_BOLD, 0, parent->item, after->item);
+			parentId = i;
+			break;
+		}
+	}
+	if (!item)
+	{
+		item = m_processTree.InsertItem(TVIF_TEXT, text, 0, 0, TVIS_BOLD, TVIS_BOLD, 0, NULL, NULL);
+		m_clients.emplace_back();
+		parentId = (int)m_clients.size() - 1;
+	}
 	std::unique_ptr<Client> client = std::make_unique<Client>();
 	client->pid = pid;
+	client->tid = tid;
 	client->item = item;
+	m_processTree.SetItemData(client->item, (DWORD_PTR)client.get());
 	InitLogViewer(client->logViewer);
 	if (m_splitter.GetSplitterPane(SPLIT_PANE_RIGHT) == m_defaultLogViewer)
 		SetCurrentLogViewer(client->logViewer);
-	m_clients.push_back(std::move(client));
+	m_clients[parentId].push_back(std::move(client));
+	m_processTree.Invalidate();
 	return 0;
 }
 
 LRESULT MainWindow::OnLogReceive(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL &bHandled)
 {
-	LogMessage *msg = (LogMessage *)wParam;
-	WCHAR wbuffer[LOG_BUFFER_SIZE + 1];
-	int r = MultiByteToWideChar(CP_UTF8, 0, msg->buffer, msg->length, wbuffer, LOG_BUFFER_SIZE + 1);
-	if (r)
-	{
-		wbuffer[r] = 0;
-		for (int i = 0; i < m_clients.size(); i++)
-			if (m_clients[i]->pid == msg->pid)
-			{
-				m_clients[i]->logViewer.AppendText(wbuffer, TRUE, FALSE);
-				if (m_splitter.GetSplitterPane(SPLIT_PANE_RIGHT) != m_clients[i]->logViewer)
-					m_processTree.SetItemState(m_clients[i]->item, TVIS_BOLD, TVIS_BOLD);
-			}
-	}
 	bHandled = TRUE;
+	LogMessage *msg = (LogMessage *)wParam;
+	for (int i = (int)m_clients.size() - 1; i >= 0; i--)
+		if (m_clients[i].front()->pid == msg->pid)
+			for (auto & client : m_clients[i])
+				if (client->tid == msg->tid)
+				{
+					std::string &msgpart = client->msgpart;
+					const char *buffer = msg->buffer;
+					int length = msg->length;
+					/* For each message packet */
+					for (;;)
+					{
+						/* Append message size */
+						while (msgpart.size() < 4 && length > 0)
+						{
+							msgpart += *buffer++;
+							length--;
+						}
+						/* No enough data for size field for now */
+						if (msgpart.size() < 4)
+							break;
+						size_t size = *(int32_t*)msgpart.c_str();
+						/* Copy data */
+						while (msgpart.size() < size && length > 0)
+						{
+							msgpart += *buffer++;
+							length--;
+						}
+						/* No enough data for now */
+						if (msgpart.size() < size)
+							break;
+						/* We got enough data, process it */
+						ProcessClientLog(client.get(), (LogPacket *)msgpart.c_str());
+						/* Clear current message buffer */
+						msgpart.clear();
+					}
+				}
 	return 0;
 }
 
@@ -98,27 +145,32 @@ LRESULT MainWindow::OnTreeItemChange(LPNMHDR pnmh)
 	HTREEITEM hItem = notification->hItem;
 	if (notification->uStateNew & TVIS_SELECTED)
 	{
-		uint32_t pid = (uint32_t)m_processTree.GetItemData(hItem);
-		for (int i = 0; i < m_clients.size(); i++)
-			if (m_clients[i]->pid == pid)
-			{
-				SetCurrentLogViewer(m_clients[i]->logViewer);
-				m_processTree.SetItemState(hItem, 0, TVIS_BOLD);
-			}
+		Client *client = (Client *)m_processTree.GetItemData(hItem);
+		SetCurrentLogViewer(client->logViewer);
+		m_processTree.SetItemState(hItem, 0, TVIS_BOLD);
 	}
 	return 0;
 }
 
-void MainWindow::InitLogViewer(CEdit &logViewer)
+void MainWindow::ProcessClientLog(Client *client, LogPacket *packet)
 {
-	logViewer.Create(m_splitter, rcDefault, NULL,
-		WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_WANTRETURN | ES_MULTILINE | ES_AUTOVSCROLL,
-		WS_EX_CLIENTEDGE);
-	logViewer.SetFont(m_logViewerFont);
-	logViewer.SetLimitText(-1);
+	WCHAR *wbuffer = (WCHAR*)alloca(sizeof(WCHAR) * (packet->packetSize + 1));
+	int len = MultiByteToWideChar(CP_UTF8, 0, packet->text, packet->len, wbuffer, packet->packetSize);
+	if (len)
+	{
+		wbuffer[len] = 0;
+		client->logViewer.AddLine(packet->type, wbuffer);
+		if (m_splitter.GetSplitterPane(SPLIT_PANE_RIGHT) != client->logViewer)
+			m_processTree.SetItemState(client->item, TVIS_BOLD, TVIS_BOLD);
+	}
 }
 
-void MainWindow::SetCurrentLogViewer(CEdit &logViewer)
+void MainWindow::InitLogViewer(LogViewer &logViewer)
+{
+	logViewer.Create(m_splitter, rcDefault);
+}
+
+void MainWindow::SetCurrentLogViewer(LogViewer &logViewer)
 {
 	HWND hOldPane = m_splitter.GetSplitterPane(SPLIT_PANE_RIGHT);
 	if (hOldPane != logViewer)

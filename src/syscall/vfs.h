@@ -37,11 +37,14 @@
 void vfs_init();
 void vfs_reset();
 void vfs_shutdown();
-int vfs_fork(HANDLE process);
+int vfs_fork(HANDLE process, DWORD process_id);
+void vfs_afterfork_parent();
+void vfs_afterfork_child();
 int vfs_store_file(struct file *f, int cloexec);
 
-int vfs_openat(int dirfd, const char *pathname, int flags, int mode, struct file **f);
-void vfs_close(int fd);
+int vfs_openat(int dirfd, const char *pathname, int flags, int internal_flags, int mode, struct file **f);
 struct file *vfs_get(int fd);
 void vfs_ref(struct file *f);
 void vfs_release(struct file *f);
+void vfs_get_root_mountpoint(struct mount_point *mp);
+bool vfs_get_mountpoint(int key, struct mount_point *mp);

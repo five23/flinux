@@ -17,8 +17,10 @@
  * along with this program. If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <fs/console.h>
 #include <str.h>
 #include <vsprintf.h>
+#include <vsscanf.h>
 
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
@@ -32,10 +34,61 @@ int kprintf(const char *format, ...)
 	va_list ap;
 	va_start(ap, format);
 	int size = kvsprintf(buffer, format, ap);
-	HANDLE handle = GetStdHandle(STD_OUTPUT_HANDLE);
-	WriteFile(handle, buffer, size, NULL, NULL);
-	FlushFileBuffers(handle);
-	return size;
+	return console_write(buffer, size);
+}
+
+int ksprintf(char *buf, const char *format, ...)
+{
+	va_list ap;
+	va_start(ap, format);
+	int len = kvsprintf(buf, format, ap);
+	buf[len] = 0;
+	return len;
+}
+
+int ksscanf(const char *buf, const char *format, ...)
+{
+	va_list ap;
+	va_start(ap, format);
+	return kvsscanf(buf, format, ap);
+}
+
+bool katoi(const char *str, int *out)
+{
+	int len = strlen(str);
+	int readlen;
+	int r = ksscanf(str, "%d%n", out, &readlen);
+	return r == 1 && readlen == len;
+}
+
+bool katou(const char *str, unsigned int *out)
+{
+	int len = strlen(str);
+	int readlen;
+	int r = ksscanf(str, "%u%n", out, &readlen);
+	return r == 1 && readlen == len;
+}
+
+void strip(char *str)
+{
+	int len = strlen(str);
+	int l;
+	for (l = 0; l < len; l++)
+		if (str[l] != ' ')
+			break;
+	if (l == len)
+	{
+		/* The whole string is space */
+		*str = 0;
+		return;
+	}
+	int r;
+	for (r = len - 1; r >= 0; r--)
+		if (str[r] != ' ')
+			break;
+	len = r - l + 1;
+	memmove(str, str + l, len);
+	str[len] = 0;
 }
 
 /*
@@ -84,6 +137,34 @@ static const uint16_t filename_transform_chars[] =
 /* Grab low "bits" bits of x */
 #define LOWBITS(x, bits) ((x) & ((1 << ((bits) + 1)) - 1))
 
+int utf8_get_sequence_len(char ch)
+{
+	if ((ch & 0x80) == 0)
+		return 1;
+	else if ((ch & 0xE0) == 0xC0)
+		return 2;
+	else if ((ch & 0xF0) == 0xE0)
+		return 3;
+	else if ((ch & 0xF8) == 0xF0)
+		return 4;
+	else
+		return -1;
+}
+
+uint32_t utf8_decode(const char *data)
+{
+	if ((data[0] & 0x80) == 0)
+		return (uint32_t)data[0];
+	else if ((data[0] & 0xE0) == 0xC0)
+		return (uint32_t)(LOWBITS(data[0], 5) << 6) + LOWBITS(data[1], 6);
+	else if ((data[0] & 0xF0) == 0xE0)
+		return (uint32_t)(LOWBITS(data[0], 4) << 12) + (LOWBITS(data[1], 6) << 6) + LOWBITS(data[2], 6);
+	else if ((data[0] & 0xF8) == 0xF0)
+		return (uint32_t)(LOWBITS(data[0], 3) << 18) + (LOWBITS(data[1], 6) << 12) + (LOWBITS(data[2], 6) << 6) + LOWBITS(data[3], 6);
+	else
+		return -1;
+}
+
 static __forceinline uint32_t utf8_read_increment(const char **data, const char *last)
 {
 	if ((**data & 0x80) == 0 && *data + 1 <= last) // 0xxxxxxx
@@ -110,7 +191,7 @@ static __forceinline uint32_t utf8_read_increment(const char **data, const char 
 		codepoint += LOWBITS(*(*data)++, 6) << 12;
 		codepoint += LOWBITS(*(*data)++, 6) << 6;
 		codepoint += LOWBITS(*(*data)++, 6);
-		return 0;
+		return codepoint;
 	}
 	else
 		return -1;
@@ -259,7 +340,7 @@ int utf8_to_utf16_filename(const char *data, int srclen, uint16_t *outdata, int 
 			uint32_t codepoint = utf8_read_increment(&data, last);
 			if (codepoint == -1)
 				return -1;
-			if (codepoint <= 0x80)
+			if (codepoint <= 0x7F)
 				codepoint = filename_transform_chars[codepoint];
 			outlen += utf16_count_len(codepoint);
 		}
@@ -310,7 +391,9 @@ int utf16_to_utf8_filename(const uint16_t *data, int srclen, char *outdata, int 
 			uint32_t codepoint = utf16_read_increment(&data, last);
 			if (codepoint == -1)
 				return -1;
-			if (filename_transform_chars[codepoint & 0x7F] == codepoint)
+			if (codepoint == '\\')
+				codepoint = '/';
+			else if (filename_transform_chars[codepoint & 0x7F] == codepoint)
 				codepoint &= 0x7F;
 			int r = utf8_write_increment(codepoint, &outdata, outlast);
 			if (r < 0)

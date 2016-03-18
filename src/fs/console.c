@@ -23,7 +23,10 @@
 #include <common/poll.h>
 #include <common/termios.h>
 #include <fs/console.h>
+#include <fs/virtual.h>
 #include <syscall/mm.h>
+#include <syscall/process.h>
+#include <syscall/sig.h>
 #include <heap.h>
 #include <log.h>
 #include <str.h>
@@ -43,7 +46,6 @@
  * to the same console simultaneously. The only thing we need to take care of is
  * when user changes the size of the window during application operation.
  */
-/* TODO: UTF-8 support */
 
 #define CONSOLE_MAX_PARAMS	16
 #define MAX_INPUT			256
@@ -51,13 +53,26 @@
 #define MAX_STRING			256
 #define DEFAULT_ATTRIBUTE	0
 
+typedef uint32_t (*charset_func)(uint32_t ch);
+struct console_cursor /* DECSC */
+{
+	int x, y;
+	int at_right_margin;
+	int bright, reverse, foreground, background;
+	int charset;
+	int origin_mode;
+	int wraparound_mode;
+};
 struct console_data
 {
 	HANDLE section, mutex;
 	HANDLE in, out;
+	HANDLE normal_buffer, alternate_buffer;
 	/* console mode settings */
 	struct termios termios;
 	int bright, reverse, foreground, background;
+	charset_func g0_charset, g1_charset;
+	int charset;
 	int insert_mode;
 	int cursor_key_mode;
 	int origin_mode;
@@ -69,12 +84,17 @@ struct console_data
 	 */
 	int x, y; /* current position, in window coordinate */
 	int at_right_margin; /* whether we are at the right margin, i.e. the invisible column after the rightmost */
+	WORD attr; /* text attribute */
 	int width, height; /* current size of the console window */
 	int buffer_height; /* current height of the screen buffer */
 	int top; /* the row number of current emulated top line in buffer coordinate */
 	int scroll_top, scroll_bottom; /* the row numbers of the margins of the scroll region */
 	int scroll_full_screen; /* whether the scrolling region is the full screen */
-	
+	char utf8_buf[4]; /* for storing unfinished utf-8 character */
+	int utf8_buf_size;
+	struct console_cursor saved_cursor;
+	int saved_top;
+
 	/* escape sequence processor */
 	int params[CONSOLE_MAX_PARAMS];
 	int param_count;
@@ -82,15 +102,57 @@ struct console_data
 	char string_buffer[MAX_STRING];
 	char input_buffer[MAX_INPUT];
 	size_t input_buffer_head, input_buffer_tail;
-	int private_mode; /* mode starts with "CSI ?" */
+	char csi_prefix; /* prefix after CSI, e.g. '?', '>' */
 	void (*processor)(char ch);
 };
 
-static struct console_data *const console = (struct console_data *)CONSOLE_DATA_BASE;
+static struct console_data *console;
 
+static uint32_t default_charset(uint32_t ch)
+{
+	return ch;
+}
+
+static uint32_t dec_special_graphics_charset(uint32_t ch)
+{
+	static const uint32_t table[32] = {
+		0x2666, 0x2591, 0x0000, 0x0000, 0x0000, 0x0000, 0x00B0, 0x00B1,
+		0x0000, 0x0000, 0x2518, 0x2510, 0x250C, 0x2514, 0x253C, 0x23BA,
+		0x23BB, 0x2500, 0x23BC, 0x23BD, 0x251C, 0x2524, 0x2534, 0x252C,
+		0x2502, 0x2264, 0x2265, 0x03C0, 0x2260, 0x00A3, 0x00B7, 0x00FF,
+	};
+	if (ch >= 0x60 && ch <= 0x7F)
+		return table[ch - 0x60];
+	else
+		return ch;
+}
+
+static charset_func parse_charset(char ch)
+{
+	switch (ch)
+	{
+	case '0': return dec_special_graphics_charset;
+	case 'B': return default_charset;
+	default: return NULL;
+	}
+}
+
+static BOOL WINAPI console_ctrlc_handler(DWORD dwCtrlType)
+{
+	if (dwCtrlType != CTRL_C_EVENT)
+		return FALSE;
+	struct siginfo info;
+	info.si_signo = SIGINT;
+	info.si_code = SI_KERNEL;
+	info.si_errno = 0;
+	signal_kill(process_get_pid(), &info);
+	return TRUE;
+}
+
+static void save_cursor();
 void console_init()
 {
-	log_info("Initializing console shared memory region.\n");
+	log_info("Initializing console shared memory region.");
 	/* TODO: mm_mmap() does not support MAP_SHARED yet */
 	HANDLE section;
 	LARGE_INTEGER section_size;
@@ -106,17 +168,18 @@ void console_init()
 	status = NtCreateSection(&section, SECTION_MAP_READ | SECTION_MAP_WRITE, &obj_attr, &section_size, PAGE_READWRITE, SEC_COMMIT, NULL);
 	if (!NT_SUCCESS(status))
 	{
-		log_error("NtCreateSection() failed, status: %x\n", status);
+		log_error("NtCreateSection() failed, status: %x", status);
 		return;
 	}
-	PVOID base_addr = console;
+	PVOID base_addr = NULL;
 	SIZE_T view_size = sizeof(struct console_data);
-	status = NtMapViewOfSection(section, NtCurrentProcess(), &base_addr, 0, sizeof(struct console_data), NULL, &view_size, ViewUnmap, 0, PAGE_READWRITE);
+	status = NtMapViewOfSection(section, NtCurrentProcess(), &base_addr, 0, sizeof(struct console_data), NULL, &view_size, ViewUnmap, MEM_TOP_DOWN, PAGE_READWRITE);
 	if (!NT_SUCCESS(status))
 	{
-		log_error("NtMapViewOfSection() failed, status: %x\n", status);
+		log_error("NtMapViewOfSection() failed, status: %x", status);
 		return;
 	}
+	console = (struct console_data *)base_addr;
 
 	SECURITY_ATTRIBUTES attr;
 	attr.nLength = sizeof(SECURITY_ATTRIBUTES);
@@ -126,29 +189,31 @@ void console_init()
 	HANDLE mutex = CreateMutexW(&attr, FALSE, NULL);
 	if (mutex == NULL)
 	{
-		log_error("CreateMutexW() failed, error code: %d\n", GetLastError());
+		log_error("CreateMutexW() failed, error code: %d", GetLastError());
 		return;
 	}
 
 	HANDLE in = CreateFileA("CONIN$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &attr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
 	if (in == INVALID_HANDLE_VALUE)
 	{
-		log_error("CreateFile(\"CONIN$\") failed, error code: %d\n", GetLastError());
+		log_error("CreateFile(\"CONIN$\") failed, error code: %d", GetLastError());
 		return;
 	}
 	HANDLE out = CreateFileA("CONOUT$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &attr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
 	if (out == INVALID_HANDLE_VALUE)
 	{
-		log_error("CreateFile(\"CONOUT$\") failed, error code: %d\n", GetLastError());
+		log_error("CreateFile(\"CONOUT$\") failed, error code: %d", GetLastError());
 		return;
 	}
 	console->section = section;
 	console->mutex = mutex;
 	console->in = in;
 	console->out = out;
+	console->normal_buffer = out;
+	console->alternate_buffer = CreateConsoleScreenBuffer(GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &attr, CONSOLE_TEXTMODE_BUFFER, NULL);
 	console->termios.c_iflag = INLCR | ICRNL;
 	console->termios.c_oflag = ONLCR | OPOST;
-	console->termios.c_cflag = 0;
+	console->termios.c_cflag = CREAD | CSIZE | B38400;
 	console->termios.c_lflag = ICANON | ECHO | ECHOCTL;
 	memset(console->termios.c_cc, 0, sizeof(console->termios.c_cc));
 	console->termios.c_cc[VINTR] = 3;
@@ -160,6 +225,8 @@ void console_init()
 	console->reverse = 0;
 	console->foreground = 7;
 	console->background = 0;
+	console->g0_charset = console->g1_charset = default_charset;
+	console->charset = 0;
 	console->insert_mode = 0;
 	console->cursor_key_mode = 0;
 	console->origin_mode = 0;
@@ -169,29 +236,44 @@ void console_init()
 	console->at_right_margin = 0;
 	console->top = 0;
 	console->scroll_full_screen = 1;
+	console->utf8_buf_size = 0;
+
+	save_cursor();
 
 	console->input_buffer_head = console->input_buffer_tail = 0;
 	console->processor = NULL;
 
-	SetConsoleMode(in, 0);
+	SetConsoleMode(in, ENABLE_PROCESSED_INPUT | ENABLE_WINDOW_INPUT);
 	SetConsoleMode(out, ENABLE_PROCESSED_OUTPUT);
+	SetConsoleCtrlHandler(console_ctrlc_handler, TRUE);
 
-	log_info("Console shared memory region successfully initialized.\n");
+	log_info("Console shared memory region successfully initialized.");
 }
 
 int console_fork(HANDLE process)
 {
-	log_info("Mapping console shared memory region to child process...\n");
-	PVOID base_addr = console;
+	log_info("Mapping console shared memory region to child process...");
+	PVOID base_addr = NULL;
 	SIZE_T view_size = sizeof(struct console_data);
 	NTSTATUS status;
-	status = NtMapViewOfSection(console->section, process, &base_addr, 0, sizeof(struct console_data), NULL, &view_size, ViewUnmap, 0, PAGE_READWRITE);
+	status = NtMapViewOfSection(console->section, process, &base_addr, 0, sizeof(struct console_data), NULL, &view_size, ViewUnmap, MEM_TOP_DOWN, PAGE_READWRITE);
 	if (!NT_SUCCESS(status))
 	{
-		log_error("NtMapViewOfSection() failed, status: %x\n", status);
+		log_error("NtMapViewOfSection() failed, status: %x", status);
+		return 0;
+	}
+	status = NtWriteVirtualMemory(process, &console, &base_addr, sizeof(PVOID), NULL);
+	if (!NT_SUCCESS(status))
+	{
+		log_error("NtWriteVirtualMemory() failed, status: %x", status);
 		return 0;
 	}
 	return 1;
+}
+
+void console_afterfork()
+{
+	SetConsoleCtrlHandler(console_ctrlc_handler, TRUE);
 }
 
 static void console_lock()
@@ -206,7 +288,7 @@ static void console_unlock()
 
 struct console_file
 {
-	struct file base_file;
+	struct virtualfs_custom custom_file;
 };
 
 static WORD get_text_attribute()
@@ -288,8 +370,18 @@ static void console_retrieve_state()
 {
 	CONSOLE_SCREEN_BUFFER_INFO info;
 	GetConsoleScreenBufferInfo(console->out, &info);
-	console->width = info.dwSize.X;
-	console->height = info.srWindow.Bottom - info.srWindow.Top + 1;
+	int new_width = info.dwSize.X;
+	int new_height = info.srWindow.Bottom - info.srWindow.Top + 1;
+	if (console->width != new_width || console->height != new_height)
+	{
+		console->width = new_width;
+		console->height = new_height;
+		struct siginfo info;
+		info.si_signo = SIGWINCH;
+		info.si_code = SI_KERNEL;
+		info.si_errno = 0;
+		signal_kill(process_get_pid(), &info);
+	}
 	console->buffer_height = info.dwSize.Y;
 	int top_min = max(0, info.dwCursorPosition.Y - console->height + 1);
 	int top_max = min(info.dwCursorPosition.Y, console->buffer_height - console->height);
@@ -377,6 +469,52 @@ static void console_set_size(int width, int height)
 	set_pos(console->x, console->y);
 	console->width = width;
 	console->height = height;
+}
+
+static void save_cursor()
+{
+	console->saved_cursor.x = console->x;
+	console->saved_cursor.y = console->y;
+	console->saved_cursor.at_right_margin = console->at_right_margin;
+	console->saved_cursor.bright = console->bright;
+	console->saved_cursor.reverse = console->reverse;
+	console->saved_cursor.foreground = console->foreground;
+	console->saved_cursor.background = console->background;
+	console->saved_cursor.charset = console->charset;
+	console->saved_cursor.origin_mode = console->origin_mode;
+	console->saved_cursor.wraparound_mode = console->wraparound_mode;
+	console->saved_top = console->top;
+}
+
+static void restore_cursor()
+{
+	console->x = console->saved_cursor.x;
+	console->y = console->saved_cursor.y;
+	console->at_right_margin = console->saved_cursor.at_right_margin;
+	console->bright = console->saved_cursor.bright;
+	console->reverse = console->saved_cursor.reverse;
+	console->foreground = console->saved_cursor.foreground;
+	console->background = console->saved_cursor.background;
+	console->charset = console->saved_cursor.charset;
+	console->origin_mode = console->saved_cursor.origin_mode;
+	console->wraparound_mode = console->saved_cursor.wraparound_mode;
+
+	console->top = console->saved_top;
+	set_pos(console->x, console->y);
+
+	SetConsoleTextAttribute(console->out, get_text_attribute());
+}
+
+static void switch_to_normal_buffer()
+{
+	console->out = console->normal_buffer;
+	SetConsoleActiveScreenBuffer(console->out);
+}
+
+static void switch_to_alternate_buffer()
+{
+	console->out = console->alternate_buffer;
+	SetConsoleActiveScreenBuffer(console->out);
 }
 
 static void move_left(int count)
@@ -473,29 +611,75 @@ static void crnl()
 	nl();
 }
 
+static void console_add_input(char *str, size_t size)
+{
+	/* TODO: Detect input buffer overflow */
+	for (size_t i = 0; i < size; i++)
+	{
+		console->input_buffer[console->input_buffer_head] = str[i];
+		console->input_buffer_head = (console->input_buffer_head + 1) % MAX_INPUT;
+	}
+}
+
 static void write_normal(const char *buf, int size)
 {
 	if (size == 0)
 		return;
 
-	while (size > 0)
+	charset_func charset = console->charset == 0? console->g0_charset: console->g1_charset;
+	WCHAR data[1024];
+	int len = 0, displen = 0;
+	int i = 0;
+	while (i < size)
 	{
 		if (console->at_right_margin && console->wraparound_mode)
 			crnl();
 		/* Write to line end at most */
-		int line_remain = min(size, console->width - console->x);
-		if (console->insert_mode && console->x + line_remain < console->width)
-			scroll(console->x, console->width - 1, console->y, console->y, line_remain, 0);
-		DWORD bytes_written;
-		WriteConsoleA(console->out, buf, line_remain, &bytes_written, NULL);
-		console->x += line_remain;
+		int line_remain = min(size - i, console->width - console->x);
+		len = 0;
+		displen = 0;
+		int seqlen = -1;
+		while (displen < line_remain && i < size)
+		{
+			console->utf8_buf[console->utf8_buf_size++] = buf[i++];
+			if (console->utf8_buf_size == 1)
+				seqlen = utf8_get_sequence_len(console->utf8_buf[0]);
+			if (seqlen < 0)
+				console->utf8_buf_size = 0;
+			if (seqlen == console->utf8_buf_size)
+			{
+				uint32_t codepoint = utf8_decode(console->utf8_buf);
+				if (codepoint >= 0 && codepoint <= 0x10FFFF)
+				{
+					/* TODO: Handle non BMP characters (not supported by conhost) */
+					int l = wcwidth(codepoint);
+					if (l > 0)
+					{
+						if (displen + l > line_remain && console->wraparound_mode)
+						{
+							i--;
+							console->utf8_buf_size--;
+							break;
+						}
+						displen += l;
+						data[len++] = charset(codepoint);
+					}
+				}
+				console->utf8_buf_size = 0;
+			}
+		}
+
+		if (console->insert_mode && console->x + displen < console->width)
+			scroll(console->x, console->width - 1, console->y, console->y, displen, 0);
+		
+		DWORD chars_written;
+		WriteConsoleW(console->out, data, len, &chars_written, NULL);
+		console->x += displen;
 		if (console->x == console->width)
 		{
 			console->x--;
 			console->at_right_margin = 1;
 		}
-		buf += line_remain;
-		size -= line_remain;
 	}
 }
 
@@ -529,7 +713,7 @@ static void erase_screen(int mode)
 	}
 	else
 	{
-		log_error("erase_screen(): Invalid mode %d\n", mode);
+		log_error("erase_screen(): Invalid mode %d", mode);
 		return;
 	}
 	DWORD num_written;
@@ -565,7 +749,7 @@ static void erase_line(int mode)
 	}
 	else
 	{
-		log_error("erase_line(): Invalid mode %d\n", mode);
+		log_error("erase_line(): Invalid mode %d", mode);
 		return;
 	}
 	DWORD num_written;
@@ -616,7 +800,7 @@ static void change_mode(int mode, int set)
 		break;
 
 	default:
-		log_error("change_mode(): mode %d not supported.\n", mode);
+		log_error("change_mode(): mode %d not supported.", mode);
 	}
 }
 
@@ -646,8 +830,56 @@ static void change_private_mode(int mode, int set)
 		console->wraparound_mode = set;
 		break;
 
+	case 47:
+		if (set)
+			switch_to_alternate_buffer();
+		else
+			switch_to_normal_buffer();
+		break;
+
+	case 1047:
+		if (set)
+		{
+			if (console->out == console->normal_buffer)
+			{
+				switch_to_alternate_buffer();
+				erase_screen(ERASE_SCREEN_BEGIN_TO_END);
+			}
+		}
+		else
+		{
+			if (console->out == console->alternate_buffer)
+				switch_to_normal_buffer();
+		}
+		break;
+
+	case 1048:
+		if (set)
+			save_cursor();
+		else
+			restore_cursor();
+		break;
+
+	case 1049:
+		if (set)
+		{
+			save_cursor();
+			if (console->out == console->normal_buffer)
+			{
+				switch_to_alternate_buffer();
+				erase_screen(ERASE_SCREEN_BEGIN_TO_END);
+			}
+		}
+		else
+		{
+			if (console->out == console->alternate_buffer)
+				switch_to_normal_buffer();
+			restore_cursor();
+		}
+		break;
+
 	default:
-		log_error("change_private_mode(): private mode %d not supported.\n", mode);
+		log_error("change_private_mode(): private mode %d not supported.", mode);
 	}
 }
 
@@ -671,7 +903,7 @@ static void control_escape_csi(char ch)
 
 	case ';':
 		if (console->param_count + 1 == CONSOLE_MAX_PARAMS)
-			log_error("Too many console parameters.\n");
+			log_error("Too many console parameters.");
 		else
 			console->param_count++;
 		break;
@@ -734,10 +966,12 @@ static void control_escape_csi(char ch)
 		break;
 
 	case 'h':
-		if (console->private_mode)
-			change_private_mode(console->params[0], 1);
+		if (console->csi_prefix == '?')
+			for (int i = 0; i <= console->param_count; i++)
+				change_private_mode(console->params[i], 1);
 		else
-			change_mode(console->params[0], 1);
+			for (int i = 0; i <= console->param_count; i++)
+				change_mode(console->params[i], 1);
 		console->processor = NULL;
 		break;
 
@@ -752,10 +986,12 @@ static void control_escape_csi(char ch)
 		break;
 
 	case 'l':
-		if (console->private_mode)
-			change_private_mode(console->params[0], 0);
+		if (console->csi_prefix == '?')
+			for (int i = 0; i <= console->param_count; i++)
+				change_private_mode(console->params[i], 0);
 		else
-			change_mode(console->params[0], 0);
+			for (int i = 0; i <= console->param_count; i++)
+				change_mode(console->params[i], 0);
 		console->processor = NULL;
 		break;
 
@@ -776,6 +1012,24 @@ static void control_escape_csi(char ch)
 
 	case 'P': /* DCH */
 		delete_character(console->params[0]? console->params[0]: 1);
+		console->processor = NULL;
+		break;
+
+	case 'c':
+		if (console->csi_prefix == '>') /* DA2 */
+		{
+			if (console->params[0] == 0)
+				console_add_input("\x1B[>61;95;0c", 11);
+			else
+				log_warning("DA2 parameter is not zero.");
+		}
+		else /* DA1 */
+		{
+			if (console->params[0] == 0)
+				log_error("DA1 not supported.");
+			else
+				log_warning("DA1 parameter is not zero.");
+		}
 		console->processor = NULL;
 		break;
 
@@ -817,6 +1071,9 @@ static void control_escape_csi(char ch)
 			case 37:
 				console->foreground = console->params[i] - 30;
 				break;
+			case 39:
+				console->foreground = 7; /* White */
+				break;
 
 			case 40:
 			case 41:
@@ -828,9 +1085,12 @@ static void control_escape_csi(char ch)
 			case 47:
 				console->background = console->params[i] - 40;
 				break;
+			case 49:
+				console->background = 0; /* Black */
+				break;
 
 			default:
-				log_error("Unknown console attribute: %d\n", console->params[i]);
+				log_error("Unknown console attribute: %d", console->params[i]);
 			}
 		}
 		/* Set updated text attribute */
@@ -856,11 +1116,15 @@ static void control_escape_csi(char ch)
 		break;
 
 	case '?':
-		console->private_mode = 1;
+		console->csi_prefix = '?';
+		break;
+
+	case '>':
+		console->csi_prefix = '?';
 		break;
 
 	default:
-		log_error("control_escape_csi(): Unhandled character %c\n", ch);
+		log_error("control_escape_csi(): Unhandled character %c", ch);
 		console->processor = NULL;
 	}
 }
@@ -889,7 +1153,7 @@ static void control_escape_osc(char ch)
 			int r = utf8_to_utf16(console->string_buffer, console->string_len, title, MAX_STRING + 1);
 			if (r < 0)
 			{
-				log_error("Invalid UTF-8 sequence.\n");
+				log_error("Invalid UTF-8 sequence.");
 				return;
 			}
 			title[r] = 0;
@@ -903,7 +1167,7 @@ static void control_escape_osc(char ch)
 		console->string_buffer[console->string_len++] = ch;
 		return;
 	}
-	log_error("control_escape_osc(): Unhandled character %c\n", ch);
+	log_error("control_escape_osc(): Unhandled character %c", ch);
 	console->processor = NULL;
 }
 
@@ -925,20 +1189,28 @@ static void control_escape_sharp(char ch)
 	}
 
 	default:
-		log_error("control_escape_sharp(): Unhandled character %c\n", ch);
+		log_error("control_escape_sharp(): Unhandled character %c", ch);
 		console->processor = NULL;
 	}
 }
 
 static void control_escape_set_default_character_set(char ch)
 {
-	log_warning("console: set default character set: %c, ignored.\n", ch);
+	charset_func c = parse_charset(ch);
+	if (c)
+		console->g0_charset = c;
+	else
+		log_warning("console: set default character set: %c, ignored.", ch);
 	console->processor = NULL;
 }
 
 static void control_escape_set_alternate_character_set(char ch)
 {
-	log_warning("console: set alternate character set: %c, ignored.\n", ch);
+	charset_func c = parse_charset(ch);
+	if (c)
+		console->g1_charset = c;
+	else
+		log_warning("console: set alternate character set: %c, ignored.", ch);
 	console->processor = NULL;
 }
 
@@ -950,7 +1222,7 @@ static void control_escape(char ch)
 		for (int i = 0; i < CONSOLE_MAX_PARAMS; i++)
 			console->params[i] = 0;
 		console->param_count = 0;
-		console->private_mode = 0;
+		console->csi_prefix = 0;
 		console->processor = control_escape_csi;
 		break;
 
@@ -990,19 +1262,19 @@ static void control_escape(char ch)
 		console->processor = control_escape_sharp;
 		break;
 
-	default:
-		log_error("control_escape(): Unhandled character %c\n", ch);
+	case '7': /* DECSC */
+		save_cursor();
 		console->processor = NULL;
-	}
-}
+		break;
 
-static void console_add_input(char *str, size_t size)
-{
-	/* TODO: Detect input buffer overflow */
-	for (size_t i = 0; i < size; i++)
-	{
-		console->input_buffer[console->input_buffer_head] = str[i];
-		console->input_buffer_head = (console->input_buffer_head + 1) % MAX_INPUT;
+	case '8': /* DECRC */
+		restore_cursor();
+		console->processor = NULL;
+		break;
+
+	default:
+		log_error("control_escape(): Unhandled character %c", ch);
+		console->processor = NULL;
 	}
 }
 
@@ -1037,6 +1309,8 @@ static int console_get_poll_status(struct file *f)
 			console_unlock();
 			return LINUX_POLLIN | LINUX_POLLOUT;
 		}
+		else if (ir.EventType == WINDOW_BUFFER_SIZE_EVENT)
+			console_retrieve_state();
 		/* Discard the event */
 		ReadConsoleInputW(console->in, &ir, 1, &num_read);
 	}
@@ -1058,10 +1332,9 @@ static int console_close(struct file *f)
 	return 0;
 }
 
-static size_t console_read(struct file *f, char *buf, size_t count)
+static size_t console_file_read(struct file *f, void *b, size_t count)
 {
-	struct console_file *console_file = (struct console_file *)f;
-
+	char *buf = (char *)b;
 	console_lock();
 	console_retrieve_state();
 
@@ -1080,6 +1353,12 @@ static size_t console_read(struct file *f, char *buf, size_t count)
 		{
 			INPUT_RECORD ir;
 			DWORD read;
+			if (signal_wait(1, &console->in, INFINITE) == WAIT_INTERRUPTED)
+			{
+				if (bytes_read == 0)
+					bytes_read = -L_EINTR;
+				break;
+			}
 			ReadConsoleInputA(console->in, &ir, 1, &read);
 			if (ir.EventType == KEY_EVENT && ir.Event.KeyEvent.bKeyDown)
 			{
@@ -1127,6 +1406,8 @@ static size_t console_read(struct file *f, char *buf, size_t count)
 				}
 				}
 			}
+			else if (ir.EventType == WINDOW_BUFFER_SIZE_EVENT)
+				console_retrieve_state();
 		}
 	}
 	else /* Non canonical mode */
@@ -1137,11 +1418,28 @@ static size_t console_read(struct file *f, char *buf, size_t count)
 		{
 			if (bytes_read > 0 && bytes_read >= vmin)
 				break;
-			/* If vmin > 0 and vtime == 0, it is a blocking read, otherwise we need to poll first */
-			if (vtime > 0 || (vmin == 0 && vtime == 0))
+			if ((vmin == 0 && vtime == 0)			/* Polling read */
+				|| (vtime > 0 && bytes_read > 0))	/* Read with interbyte timeout. Apply after reading first character */
 			{
-				if (WaitForSingleObject(console->in, vtime * 100) == WAIT_TIMEOUT)
+				DWORD r = signal_wait(1, &console->in, vtime * 100);
+				if (r == WAIT_TIMEOUT)
 					break;
+				if (r == WAIT_INTERRUPTED)
+				{
+					if (bytes_read == 0)
+						bytes_read = -L_EINTR;
+					break;
+				}
+			}
+			else
+			{
+				/* Blocking read */
+				if (signal_wait(1, &console->in, INFINITE) == WAIT_INTERRUPTED)
+				{
+					if (bytes_read == 0)
+						bytes_read = -L_EINTR;
+					break;
+				}
 			}
 			INPUT_RECORD ir;
 			DWORD read;
@@ -1219,6 +1517,8 @@ static size_t console_read(struct file *f, char *buf, size_t count)
 				}
 				}
 			}
+			else if (ir.EventType == WINDOW_BUFFER_SIZE_EVENT)
+				console_retrieve_state();
 			else
 			{
 				/* TODO: Other types of input */
@@ -1232,10 +1532,14 @@ read_done:
 	return bytes_read;
 }
 
-static size_t console_write(struct file *f, const char *buf, size_t count)
+size_t console_read(void *b, size_t count)
 {
-	struct console_file *console_file = (struct console_file *)f;
+	return console_file_read(NULL, b, count);
+}
 
+static size_t console_file_write(struct file *f, const void *b, size_t count)
+{
+	const char *buf = (const char *)b;
 	console_lock();
 	console_retrieve_state();
 	#define OUTPUT() \
@@ -1248,7 +1552,7 @@ static size_t console_write(struct file *f, const char *buf, size_t count)
 	size_t i;
 	for (i = 0; i < count; i++)
 	{
-		char ch = buf[i];
+		unsigned char ch = buf[i];
 		if (ch == 0x1B) /* Escape */
 		{
 			OUTPUT();
@@ -1284,17 +1588,24 @@ static size_t console_write(struct file *f, const char *buf, size_t count)
 			else
 				nl();
 		}
-		else if (ch == 0x0E || ch == 0x0F)
+		else if (ch == 0x0E)
 		{
-			/* Shift In and Shift Out */
+			/* Shift Out */
 			OUTPUT();
+			console->charset = 1;
+		}
+		else if (ch == 0x0F)
+		{
+			/* Shift In */
+			OUTPUT();
+			console->charset = 0;
 		}
 		else if (console->processor)
 			console->processor(ch);
 		else if (ch < 0x20)
 		{
 			OUTPUT();
-			log_error("Unhandled control character '\\x%x'\n", ch);
+			log_error("Unhandled control character '\\x%x'", ch);
 		}
 		else if (last == -1)
 			last = i;
@@ -1304,35 +1615,17 @@ static size_t console_write(struct file *f, const char *buf, size_t count)
 	set_pos(console->x, console->y);
 	console_unlock();
 #if 0
-	char str[4096];
+	char str[1024];
 	memcpy(str, buf, count);
-	str[count] = '\n';
-	str[count + 1] = 0;
+	str[count] = 0;
 	log_debug(str);
 #endif
 	return count;
 }
 
-static int console_stat(struct file *f, struct newstat *buf)
+size_t console_write(const void *buf, size_t b)
 {
-	INIT_STRUCT_NEWSTAT_PADDING(buf);
-	buf->st_dev = mkdev(0, 1);
-	buf->st_ino = 0;
-	buf->st_mode = S_IFCHR + 0644;
-	buf->st_nlink = 1;
-	buf->st_uid = 0;
-	buf->st_gid = 0;
-	buf->st_rdev = mkdev(5, 1);
-	buf->st_size = 0;
-	buf->st_blksize = 4096;
-	buf->st_blocks = 0;
-	buf->st_atime = 0;
-	buf->st_atime_nsec = 0;
-	buf->st_mtime = 0;
-	buf->st_mtime_nsec = 0;
-	buf->st_ctime = 0;
-	buf->st_ctime_nsec = 0;
-	return 0;
+	return console_file_write(NULL, buf, b);
 }
 
 static void console_update_termios()
@@ -1348,7 +1641,7 @@ static int console_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 	/* TODO: What is the different between S/SW/SF variants? */
 	switch (cmd)
 	{
-	case TCGETS:
+	case L_TCGETS:
 	{
 		struct termios *t = (struct termios *)arg;
 		memcpy(t, &console->termios, sizeof(struct termios));
@@ -1356,9 +1649,9 @@ static int console_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 		break;
 	}
 
-	case TCSETS:
-	case TCSETSW:
-	case TCSETSF:
+	case L_TCSETS:
+	case L_TCSETSW:
+	case L_TCSETSF:
 	{
 		struct termios *t = (struct termios *)arg;
 		memcpy(&console->termios, t, sizeof(struct termios));
@@ -1367,22 +1660,22 @@ static int console_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 		break;
 	}
 
-	case TIOCGPGRP:
+	case L_TIOCGPGRP:
 	{
-		log_warning("Unsupported TIOCGPGRP: Return fake result.\n");
-		*(pid_t *)arg = GetCurrentProcessId();
+		log_warning("Unsupported TIOCGPGRP: Return fake result.");
+		*(pid_t *)arg = process_get_pgid(0);
 		r = 0;
 		break;
 	}
 
-	case TIOCSPGRP:
+	case L_TIOCSPGRP:
 	{
-		log_warning("Unsupported TIOCSPGRP: Do nothing.\n");
+		log_warning("Unsupported TIOCSPGRP: Do nothing.");
 		r = 0;
 		break;
 	}
 
-	case TIOCGWINSZ:
+	case L_TIOCGWINSZ:
 	{
 		struct winsize *win = (struct winsize *)arg;
 		CONSOLE_SCREEN_BUFFER_INFO info;
@@ -1396,7 +1689,7 @@ static int console_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 		break;
 	}
 
-	case TIOCSWINSZ:
+	case L_TIOCSWINSZ:
 	{
 		const struct winsize *win = (const struct winsize *)arg;
 		console_set_size(win->ws_col, win->ws_row);
@@ -1405,8 +1698,8 @@ static int console_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 	}
 
 	default:
-		log_error("console: unknown ioctl command: %x\n", cmd);
-		r = -EINVAL;
+		log_error("console: unknown ioctl command: %x", cmd);
+		r = -L_EINVAL;
 		break;
 	}
 	console_unlock();
@@ -1417,17 +1710,18 @@ static const struct file_ops console_ops = {
 	.get_poll_status = console_get_poll_status,
 	.get_poll_handle = console_get_poll_handle,
 	.close = console_close,
-	.read = console_read,
-	.write = console_write,
-	.stat = console_stat,
+	.read = console_file_read,
+	.write = console_file_write,
+	.stat = virtualfs_custom_stat,
 	.ioctl = console_ioctl,
 };
+
+struct virtualfs_custom_desc console_desc = VIRTUALFS_CUSTOM(mkdev(5, 1), console_alloc);
 
 struct file *console_alloc()
 {
 	struct console_file *f = (struct console_file *)kmalloc(sizeof(struct console_file));
-	f->base_file.op_vtable = &console_ops;
-	f->base_file.ref = 1;
-	f->base_file.flags = O_LARGEFILE | O_RDWR;
+	file_init(&f->custom_file.base_file, &console_ops, O_LARGEFILE | O_RDWR);
+	virtualfs_init_custom(f, &console_desc);
 	return (struct file *)f;
 }

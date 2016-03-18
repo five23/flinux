@@ -19,8 +19,51 @@
 
 #pragma once
 
+#include <common/signal.h>
+#include <common/sigcontext.h>
+
+#include <stdint.h>
+#define WIN32_LEAN_AND_MEAN
+#include <Windows.h>
+
+struct syscall_context
+{
+	/* DO NOT REORDER */
+	/* Context for fork() */
+	DWORD ebx;
+	DWORD ecx;
+	DWORD edx;
+	DWORD esi;
+	DWORD edi;
+	DWORD ebp;
+	DWORD esp;
+	DWORD eip;
+
+	/* The following are not used by fork() */
+	DWORD eax;
+	DWORD eflags;
+};
+
+void dbt_init_thread();
 void dbt_init();
 void dbt_reset();
 void dbt_shutdown();
 
 void __declspec(noreturn) dbt_run(size_t pc, size_t sp);
+void __declspec(noreturn) dbt_restore_fork_context(struct syscall_context *context);
+
+/* Get current GS register value */
+int dbt_get_gs();
+
+/* Reload TLS information at thread entry */
+void dbt_update_tls(int gs);
+
+/* Called when an executable code region changes, determines whether we need to flush code cache */
+void dbt_code_changed(size_t pc, size_t len);
+
+/* Deliver the signal to the main thread's context
+ * This function can only called from the signal thread */
+void dbt_deliver_signal(HANDLE thread, CONTEXT *context);
+
+/* Return from signal */
+void __declspec(noreturn) dbt_sigreturn(struct sigcontext *context);

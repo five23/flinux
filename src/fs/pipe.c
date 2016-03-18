@@ -27,78 +27,214 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
+#include <ntdll.h>
+
+/* POSIX.1 says that write(2)s of less than PIPE_BUF bytes must be atomic */
+#define PIPE_BUF	4096
 
 struct pipe_file
 {
 	struct file base_file;
 	HANDLE handle;
-	int is_read;
+	HANDLE read_event; /* Signaled when there is read data available */
+	HANDLE write_event; /* Signaled when there is write data available */
+	bool is_read;
 };
 
-static HANDLE pipe_get_poll_handle(struct file *f, int **poll_flags)
+static int pipe_get_poll_status(struct file *f)
+{
+	struct pipe_file *pipe = (struct pipe_file *) f;
+	/* Query current pipe quota */
+	FILE_PIPE_LOCAL_INFORMATION info;
+	IO_STATUS_BLOCK status_block;
+	NTSTATUS status;
+	status = NtQueryInformationFile(pipe->handle, &status_block, &info, sizeof(info), FilePipeLocalInformation);
+	if (!NT_SUCCESS(status))
+	{
+		log_error("NtQueryInformationFile() failed, status: %x", status);
+		return LINUX_POLLERR;
+	}
+	int r = 0;
+	if ((pipe->is_read && info.ReadDataAvailable) || (!pipe->is_read && info.WriteQuotaAvailable < info.OutboundQuota))
+	{
+		NtSetEvent(pipe->read_event, NULL);
+		if (pipe->is_read)
+			r |= LINUX_POLLIN;
+	}
+	else
+		NtClearEvent(pipe->read_event);
+	if ((pipe->is_read && info.ReadDataAvailable < info.InboundQuota) || (!pipe->is_read && info.WriteQuotaAvailable))
+	{
+		NtSetEvent(pipe->write_event, NULL);
+		if (!pipe->is_read)
+			r |= LINUX_POLLOUT;
+	}
+	else
+		NtClearEvent(pipe->write_event);
+	if (info.NamedPipeState != FILE_PIPE_CONNECTED_STATE)
+	{
+		log_info("Broken pipe.");
+		NtSetEvent(pipe->read_event, NULL);
+		NtSetEvent(pipe->write_event, NULL);
+		return LINUX_POLLIN | LINUX_POLLOUT && LINUX_POLLHUP;
+	}
+	return r;
+}
+
+static HANDLE pipe_get_poll_handle(struct file *f, int *poll_flags)
 {
 	struct pipe_file *pipe = (struct pipe_file *) f;
 	if (pipe->is_read)
+	{
 		*poll_flags = LINUX_POLLIN;
+		return pipe->read_event;
+	}
 	else
+	{
 		*poll_flags = LINUX_POLLOUT;
-	return pipe->handle;
+		return pipe->write_event;
+	}
 }
 
 static int pipe_close(struct file *f)
 {
 	struct pipe_file *pipe = (struct pipe_file *)f;
+	NtClose(pipe->read_event);
+	NtClose(pipe->write_event);
 	CloseHandle(pipe->handle);
 	kfree(pipe, sizeof(struct pipe_file));
 	return 0;
 }
 
-static size_t pipe_read(struct file *f, char *buf, size_t count)
+static void pipe_update_events(struct pipe_file *pipe)
 {
+	FILE_PIPE_LOCAL_INFORMATION info;
+	IO_STATUS_BLOCK status_block;
+	NTSTATUS status;
+	status = NtQueryInformationFile(pipe->handle, &status_block, &info, sizeof(info), FilePipeLocalInformation);
+	if (!NT_SUCCESS(status))
+	{
+		log_error("NtQueryInformationFile() failed, status: %x", status);
+		return;
+	}
+	if ((pipe->is_read && info.ReadDataAvailable) || (!pipe->is_read && info.WriteQuotaAvailable < info.OutboundQuota))
+		NtSetEvent(pipe->read_event, NULL);
+	else
+		NtClearEvent(pipe->read_event);
+	if ((pipe->is_read && info.ReadDataAvailable < info.InboundQuota) || (!pipe->is_read && info.WriteQuotaAvailable))
+		NtSetEvent(pipe->write_event, NULL);
+	else
+		NtClearEvent(pipe->write_event);
+	if (info.NamedPipeState != FILE_PIPE_CONNECTED_STATE)
+	{
+		NtSetEvent(pipe->read_event, NULL);
+		NtSetEvent(pipe->write_event, NULL);
+	}
+}
+
+static size_t pipe_read(struct file *f, void *buf, size_t count)
+{
+	AcquireSRWLockShared(&f->rw_lock);
 	struct pipe_file *pipe = (struct pipe_file *)f;
+	ssize_t r;
 	if (!pipe->is_read)
 	{
-		log_warning("read() on pipe write end.\n");
-		return -EBADF;
+		log_warning("read() on pipe write end.");
+		r = -L_EBADF;
+		goto out;
+	}
+	if (f->flags & O_NONBLOCK)
+	{
+		if (WaitForSingleObject(pipe->read_event, 0) == WAIT_TIMEOUT)
+		{
+			r = -L_EAGAIN;
+			goto out;
+		}
 	}
 	size_t num_read;
 	if (!ReadFile(pipe->handle, buf, count, &num_read, NULL))
 	{
 		if (GetLastError() == ERROR_BROKEN_PIPE)
 		{
-			log_info("Pipe closed. Read returns 0.\n");
-			return 0;
+			log_info("Pipe closed. Read returns 0.");
+			r = 0;
+			goto out;
 		}
-		return -EIO;
+		r = -L_EIO;
+		goto out;
 	}
-	return num_read;
+	r = num_read;
+out:
+	pipe_update_events(pipe);
+	ReleaseSRWLockShared(&f->rw_lock);
+	return r;
 }
 
-static size_t pipe_write(struct file *f, const char *buf, size_t count)
+static size_t pipe_write(struct file *f, const void *buf, size_t count)
 {
+	AcquireSRWLockShared(&f->rw_lock);
 	struct pipe_file *pipe = (struct pipe_file *)f;
+	ssize_t r;
 	if (pipe->is_read)
 	{
-		log_warning("write() on pipe read end.\n");
-		return -EBADF;
+		log_warning("write() on pipe read end.");
+		r = -L_EBADF;
+	}
+	if (f->flags & O_NONBLOCK)
+	{
+		if (WaitForSingleObject(pipe->write_event, 0) == WAIT_TIMEOUT)
+		{
+			r = -L_EAGAIN;
+			goto out;
+		}
+		/* Make sure we have enough write quota available */
+		FILE_PIPE_LOCAL_INFORMATION info;
+		IO_STATUS_BLOCK status_block;
+		NTSTATUS status;
+		status = NtQueryInformationFile(pipe->handle, &status_block, &info, sizeof(info), FilePipeLocalInformation);
+		if (!NT_SUCCESS(status))
+		{
+			log_error("NtQueryInformationFile() failed, status: %x", status);
+			r = -L_EIO;
+			goto out;
+		}
+		if (info.NamedPipeState != FILE_PIPE_CONNECTED_STATE)
+		{
+			log_info("Write failed: broken pipe.");
+			/* TODO: Send SIGPIPE signal */
+			r = -L_EPIPE;
+			goto out;
+		}
+		/* Data length less than PIPE_BUF must be atomic */
+		if (info.WriteQuotaAvailable < min(PIPE_BUF, count))
+		{
+			r = -L_EAGAIN;
+			goto out;
+		}
 	}
 	size_t num_written;
 	if (!WriteFile(pipe->handle, buf, count, &num_written, NULL))
 	{
 		if (GetLastError() == ERROR_BROKEN_PIPE)
 		{
-			log_info("Write failed: broken pipe.\n");
+			log_info("Write failed: broken pipe.");
 			/* TODO: Send SIGPIPE signal */
-			return -EPIPE;
+			r = -L_EPIPE;
+			goto out;
 		}
-		return -EIO;
+		r = -L_EIO;
+		goto out;
 	}
-	return num_written;
+	r = num_written;
+out:
+	pipe_update_events(pipe);
+	ReleaseSRWLockShared(&f->rw_lock);
+	return r;
 }
 
 static int pipe_llseek(struct file *f, loff_t offset, loff_t *newoffset, int whence)
 {
-	return -ESPIPE;
+	return -L_ESPIPE;
 }
 
 static int pipe_stat(struct file *f, struct newstat *buf)
@@ -124,6 +260,7 @@ static int pipe_stat(struct file *f, struct newstat *buf)
 }
 
 static const struct file_ops pipe_ops = {
+	.get_poll_status = pipe_get_poll_status,
 	.get_poll_handle = pipe_get_poll_handle,
 	.close = pipe_close,
 	.read = pipe_read,
@@ -132,15 +269,15 @@ static const struct file_ops pipe_ops = {
 	.stat = pipe_stat,
 };
 
-static struct file *pipe_create_file(HANDLE handle, int is_read, int flags)
+static struct file *pipe_create_file(HANDLE handle, HANDLE read_event, HANDLE write_event, bool is_read, int flags)
 {
 	struct pipe_file *pipe = (struct pipe_file *)kmalloc(sizeof(struct pipe_file));
-	pipe->base_file.op_vtable = &pipe_ops;
-	pipe->base_file.ref = 1;
-	pipe->base_file.flags = is_read? O_RDONLY: O_WRONLY;
+	file_init(&pipe->base_file, &pipe_ops, is_read ? O_RDONLY: O_WRONLY);
 	pipe->handle = handle;
+	pipe->read_event = read_event;
+	pipe->write_event = write_event;
 	pipe->is_read = is_read;
-	return pipe;
+	return (struct file *)pipe;
 }
 
 int pipe_alloc(struct file **fread, struct file **fwrite, int flags)
@@ -152,10 +289,39 @@ int pipe_alloc(struct file **fread, struct file **fwrite, int flags)
 	attr.bInheritHandle = TRUE;
 	if (!CreatePipe(&read_handle, &write_handle, &attr, 0))
 	{
-		log_warning("CreatePipe() failed, error code: %d\n");
-		return -EMFILE; /* TODO: Find an appropriate flag */
+		log_warning("CreatePipe() failed, error code: %d");
+		return -L_EMFILE; /* TODO: Find an appropriate flag */
 	}
-	*fread = pipe_create_file(read_handle, 1, flags);
-	*fwrite = pipe_create_file(write_handle, 0, flags);
+	OBJECT_ATTRIBUTES oa;
+	HANDLE read_event, write_event;
+	NTSTATUS status;
+	InitializeObjectAttributes(&oa, NULL, OBJ_INHERIT, NULL, NULL);
+	status = NtCreateEvent(&read_event, EVENT_ALL_ACCESS, &oa, NotificationEvent, FALSE);
+	if (!NT_SUCCESS(status))
+	{
+		log_error("NtCreateEvent() failed, status: %x", status);
+		return -L_ENOMEM;
+	}
+	status = NtCreateEvent(&write_event, EVENT_ALL_ACCESS, &oa, NotificationEvent, FALSE);
+	if (!NT_SUCCESS(status))
+	{
+		log_error("NtCreateEvent() failed, status: %x", status);
+		return -L_ENOMEM;
+	}
+	HANDLE read_event2, write_event2;
+	status = NtDuplicateObject(NtCurrentProcess(), read_event, NtCurrentProcess(), &read_event2, 0, OBJ_INHERIT, DUPLICATE_SAME_ACCESS);
+	if (!NT_SUCCESS(status))
+	{
+		log_error("NtDuplicateObject() failed, status: %x", status);
+		return -L_ENOMEM;
+	}
+	status = NtDuplicateObject(NtCurrentProcess(), write_event, NtCurrentProcess(), &write_event2, 0, OBJ_INHERIT, DUPLICATE_SAME_ACCESS);
+	if (!NT_SUCCESS(status))
+	{
+		log_error("NtDuplicateObject() failed, status: %x", status);
+		return -L_ENOMEM;
+	}
+	*fread = pipe_create_file(read_handle, read_event, write_event, true, flags);
+	*fwrite = pipe_create_file(write_handle, read_event2, write_event2, false, flags);
 	return 0;
 }

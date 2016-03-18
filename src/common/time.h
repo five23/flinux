@@ -12,6 +12,25 @@ struct linux_timeval
 	long tv_usec;		/* and microseconds */
 };
 
+struct timezone
+{
+	int tz_minuteswest;		/* minutes west of Greenwich */
+	int tz_dsttime;			/* type of DST correction */
+};
+
+#define ITIMER_REAL				0
+#define ITIMER_VIRTUAL			1
+#define ITIMER_PROF				2
+
+struct itimerval
+{
+	struct linux_timeval it_interval;	/* timer interval */
+	struct linux_timeval it_value;		/* current value */
+};
+
+typedef int clockid_t;
+typedef int timer_t;
+
 #define CLOCK_REALTIME				0
 #define CLOCK_MONOTONIC				1
 #define CLOCK_PROCESS_CPUTIME_ID	2

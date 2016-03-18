@@ -27,8 +27,21 @@
 struct LogMessage
 {
 	uint32_t pid;
+	uint32_t tid;
 	int length;
 	char *buffer;
+};
+
+#define LOG_DEBUG		0
+#define LOG_INFO		1
+#define LOG_WARNING		2
+#define LOG_ERROR		3
+struct LogPacket
+{
+	uint32_t packetSize;
+	uint32_t type;
+	uint32_t len;
+	char text[1];
 };
 
 class LogServer
@@ -59,9 +72,11 @@ private:
 	void RemoveClient(Client *client);
 	void RunWorker();
 
-	std::thread m_worker;
+	HANDLE m_hWorker;
 	bool m_started;
 	HWND m_hMainWnd;
 	HANDLE m_hCompletionPort;
 	std::vector<std::unique_ptr<Client>> m_clients;
+
+	friend DWORD WINAPI ThreadProc(LPVOID lpParameter);
 };
